@@ -109,6 +109,10 @@ def generate_redline_docx(
         doc.add_heading("Issues List", level=2)
         _add_issues_table(doc, issues_list)
 
+    # Ensure Word opens this file in a review-friendly state so native
+    # w:ins / w:del revisions are visible by default.
+    _ensure_review_settings(doc)
+
     # ── Write to buffer ──────────────────────────────────────────
     buf = io.BytesIO()
     doc.save(buf)
@@ -128,6 +132,38 @@ def _compute_diffs(text1: str, text2: str):
 def _iso_now_utc() -> str:
     """Return current UTC time in Word-friendly ISO8601 format."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _ensure_review_settings(doc: Document) -> None:
+    """
+    Force review metadata/settings so Word shows tracked revisions by default.
+    """
+    settings = doc.settings.element
+
+    if settings.find(qn("w:trackRevisions")) is None:
+        settings.append(OxmlElement("w:trackRevisions"))
+
+    revision_view = settings.find(qn("w:revisionView"))
+    if revision_view is None:
+        revision_view = OxmlElement("w:revisionView")
+        settings.append(revision_view)
+
+    # Ask Word to show markup/comments/ins-del on open.
+    revision_view.set(qn("w:markup"), "1")
+    revision_view.set(qn("w:comments"), "1")
+    revision_view.set(qn("w:insDel"), "1")
+    revision_view.set(qn("w:formatting"), "1")
+    revision_view.set(qn("w:inkAnnotations"), "1")
+
+    # Remove view flags that can suppress revision rendering.
+    for tag in (
+        "w:doNotShowInsDel",
+        "w:doNotShowMarkup",
+        "w:doNotShowComments",
+    ):
+        node = settings.find(qn(tag))
+        if node is not None:
+            settings.remove(node)
 
 
 def _needs_space_preserve(text: str) -> bool:

@@ -286,6 +286,32 @@ def unified_review_contract(
             "output": {"applied": 0, "fallback_used": False},
         })
 
+    # ── Step 2.5: Deterministic safeguard for Rule 1 ─────────────
+    # Ensure trade secret references are always legally qualified, even if
+    # analysis/execution missed this simple add_text rule.
+    safeguarded_text, safeguard_mods = _enforce_trade_secret_qualifier(
+        result.get("final_text", "")
+    )
+    if safeguard_mods:
+        result["final_text"] = safeguarded_text
+        result["modifications"].extend(safeguard_mods)
+        result["step_trace"].append({
+            "step": "Step 2.5",
+            "name": "Deterministic Safeguard",
+            "engine": "Local regex guardrail",
+            "thinking": [
+                "Detected unqualified trade secret references in final text.",
+                "Applied deterministic qualifier insertion for Rule 1 to prevent silent misses.",
+            ],
+            "output": {
+                "rule_id": "rule_1",
+                "applied": len(safeguard_mods),
+            },
+        })
+        logger.info(
+            "Safeguard applied Rule 1 qualifier %s time(s)", len(safeguard_mods)
+        )
+
     # ── Step 3: Issues List (optional) ──────────────────────────
     if generate_issues:
         _progress("issues", "Generating Issues List & risk summary…")
@@ -428,6 +454,39 @@ def _local_find_replace(
         failed.append(mod)
 
     return current, applied, failed
+
+
+def _enforce_trade_secret_qualifier(text: str) -> tuple[str, List[Dict[str, Any]]]:
+    """
+    Deterministically enforce Rule 1:
+    add "(as defined by applicable law)" after unqualified "trade secret(s)".
+
+    This runs as a final guardrail so misses in the LLM planning/execution path
+    do not silently leave Rule 1 unapplied.
+    """
+    qualifier = " (as defined by applicable law)"
+    pattern = re.compile(
+        r"\b(trade secrets?)\b(?!\s*\(as defined by applicable law\))",
+        flags=re.IGNORECASE,
+    )
+    applied: List[Dict[str, Any]] = []
+
+    def _replace(match: re.Match) -> str:
+        original = match.group(0)
+        modified = f"{original}{qualifier}"
+        applied.append({
+            "rule_id": "rule_1",
+            "rule_title": "Qualify 'trade secret' legally",
+            "original_fragment": original,
+            "modified_fragment": modified,
+            "modification_type": "insert",
+            "explanation": "Applied deterministic Rule 1 safeguard",
+            "severity": "P1",
+        })
+        return modified
+
+    updated = pattern.sub(_replace, text or "")
+    return updated, applied
 
 
 def load_playbook_entries(
