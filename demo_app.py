@@ -3,7 +3,7 @@ AI Legal Assistant — Contract Review Demo
 
 Architecture (v3):
   - Unified pipeline: analysis (LLM) → execution (local + LLM fallback) → issues (LLM)
-  - Dual model presets: quality (o3 + gpt-4o) / cost (gpt-4o + gpt-4o-mini)
+  - Model preset: quality (o3 + gpt-4o)
   - Word Track Changes output
   - Issues List / Risk Summary
   - Own Paper + Counterparty Paper modes
@@ -14,11 +14,13 @@ import os
 import sys
 import json
 import logging
+import re
 from datetime import datetime
 from io import BytesIO
 import streamlit as st
 import diff_match_patch as dmp_module
 from docx import Document
+from docx.oxml.ns import qn
 
 # ── Logging ──────────────────────────────────────────────────────
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -155,20 +157,232 @@ def diff_changed(text1: str, text2: str):
     return len(ops) > 0, len(ops)
 
 
-def parse_uploaded_contract(uploaded_file):
+_NUM_TOKEN_RE = re.compile(r"%(\d+)")
+
+
+def _to_roman(value: int) -> str:
+    if value <= 0:
+        return str(value)
+    pairs = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ]
+    result = []
+    remaining = value
+    for number, symbol in pairs:
+        while remaining >= number:
+            result.append(symbol)
+            remaining -= number
+    return "".join(result)
+
+
+def _to_alpha(value: int, uppercase: bool = False) -> str:
+    if value <= 0:
+        return str(value)
+    letters = []
+    n = value
+    while n > 0:
+        n -= 1
+        letters.append(chr(ord("A" if uppercase else "a") + (n % 26)))
+        n //= 26
+    return "".join(reversed(letters))
+
+
+def _format_number_token(value: int, num_fmt: str) -> str:
+    fmt = (num_fmt or "decimal").lower()
+    if fmt == "decimalzero" and value < 10:
+        return f"0{value}"
+    if fmt in {"decimal", "decimalzero"}:
+        return str(value)
+    if fmt == "lowerletter":
+        return _to_alpha(value, uppercase=False)
+    if fmt == "upperletter":
+        return _to_alpha(value, uppercase=True)
+    if fmt == "lowerroman":
+        return _to_roman(value).lower()
+    if fmt == "upperroman":
+        return _to_roman(value)
+    return str(value)
+
+
+def _parse_level_definition(level_elm):
+    num_fmt_elm = level_elm.find(qn("w:numFmt"))
+    lvl_text_elm = level_elm.find(qn("w:lvlText"))
+    start_elm = level_elm.find(qn("w:start"))
+    num_fmt = num_fmt_elm.get(qn("w:val")) if num_fmt_elm is not None else "decimal"
+    lvl_text = lvl_text_elm.get(qn("w:val")) if lvl_text_elm is not None else None
+    start_val = 1
+    if start_elm is not None:
+        raw_start = start_elm.get(qn("w:val"))
+        if raw_start is not None:
+            try:
+                start_val = int(raw_start)
+            except ValueError:
+                start_val = 1
+    return {
+        "num_fmt": num_fmt or "decimal",
+        "lvl_text": lvl_text,
+        "start": start_val,
+    }
+
+
+def _load_numbering_levels(doc: Document):
+    try:
+        numbering_root = doc.part.numbering_part.element
+    except Exception:
+        return {}
+
+    abstract_levels = {}
+    for abstract in numbering_root.findall(qn("w:abstractNum")):
+        abstract_id = abstract.get(qn("w:abstractNumId"))
+        if not abstract_id:
+            continue
+        level_map = {}
+        for level in abstract.findall(qn("w:lvl")):
+            ilvl_raw = level.get(qn("w:ilvl"), "0")
+            try:
+                ilvl = int(ilvl_raw)
+            except ValueError:
+                ilvl = 0
+            level_map[ilvl] = _parse_level_definition(level)
+        abstract_levels[abstract_id] = level_map
+
+    numbering_levels = {}
+    for num in numbering_root.findall(qn("w:num")):
+        num_id = num.get(qn("w:numId"))
+        if not num_id:
+            continue
+        abs_elm = num.find(qn("w:abstractNumId"))
+        if abs_elm is None:
+            continue
+        abstract_id = abs_elm.get(qn("w:val"))
+        if not abstract_id:
+            continue
+
+        merged_levels = dict(abstract_levels.get(abstract_id, {}))
+        for override in num.findall(qn("w:lvlOverride")):
+            ilvl_raw = override.get(qn("w:ilvl"), "0")
+            try:
+                ilvl = int(ilvl_raw)
+            except ValueError:
+                ilvl = 0
+
+            override_level = override.find(qn("w:lvl"))
+            if override_level is not None:
+                merged_levels[ilvl] = _parse_level_definition(override_level)
+
+            start_override = override.find(qn("w:startOverride"))
+            if start_override is not None:
+                raw_start = start_override.get(qn("w:val"))
+                if raw_start is not None:
+                    try:
+                        start_val = int(raw_start)
+                    except ValueError:
+                        start_val = 1
+                    level_def = dict(merged_levels.get(ilvl, {}))
+                    level_def["start"] = start_val
+                    level_def.setdefault("num_fmt", "decimal")
+                    merged_levels[ilvl] = level_def
+
+        numbering_levels[num_id] = merged_levels
+
+    return numbering_levels
+
+
+def _extract_docx_text_with_numbering(content: bytes) -> str:
+    doc = Document(BytesIO(content))
+    numbering_levels = _load_numbering_levels(doc)
+    list_counters = {}
+    extracted = []
+
+    for para in doc.paragraphs:
+        text = (para.text or "").strip()
+        if not text:
+            continue
+
+        prefix = ""
+        ppr = para._p.pPr
+        num_pr = ppr.numPr if ppr is not None else None
+        if num_pr is not None and num_pr.numId is not None:
+            num_id = str(num_pr.numId.val)
+            try:
+                ilvl = int(num_pr.ilvl.val) if num_pr.ilvl is not None else 0
+            except ValueError:
+                ilvl = 0
+
+            level_defs = numbering_levels.get(num_id, {})
+            level_state = list_counters.setdefault(num_id, {})
+
+            start_val = int(level_defs.get(ilvl, {}).get("start", 1))
+            current = level_state.get(ilvl, start_val - 1) + 1
+            level_state[ilvl] = current
+
+            for key in list(level_state.keys()):
+                if key > ilvl:
+                    level_state.pop(key, None)
+
+            level_def = level_defs.get(ilvl, {})
+            num_fmt = str(level_def.get("num_fmt", "decimal"))
+            lvl_text = level_def.get("lvl_text") or f"%{ilvl + 1}."
+
+            if num_fmt.lower() == "bullet":
+                prefix = "•"
+            else:
+                def _replace_level_token(match):
+                    level_index = int(match.group(1)) - 1
+                    level_value = level_state.get(level_index)
+                    if level_value is None:
+                        return ""
+                    token_fmt = str(level_defs.get(level_index, {}).get("num_fmt", "decimal"))
+                    return _format_number_token(level_value, token_fmt)
+
+                prefix = _NUM_TOKEN_RE.sub(_replace_level_token, str(lvl_text))
+                prefix = prefix.replace("\t", " ").strip()
+                if not prefix:
+                    prefix = f"{current}."
+
+        if prefix and not text.startswith(prefix):
+            text = f"{prefix} {text}"
+        extracted.append(text)
+
+    return "\n\n".join(extracted)
+
+
+def parse_uploaded_contract(uploaded_file, store_source_docx: bool = False):
     if not uploaded_file:
+        if store_source_docx:
+            st.session_state.pop("review_source_docx_bytes", None)
         return None
     name = uploaded_file.name.lower()
     if name.endswith(".docx"):
         try:
             content = uploaded_file.read()
+            if store_source_docx:
+                st.session_state["review_source_docx_bytes"] = content
             doc = Document(BytesIO(content))
             return "\n\n".join(p.text.strip() for p in doc.paragraphs if p.text.strip())
         except Exception as e:
+            if store_source_docx:
+                st.session_state.pop("review_source_docx_bytes", None)
             st.warning(f".docx parsing failed: {e}")
             return None
     elif name.endswith(".txt"):
+        if store_source_docx:
+            st.session_state.pop("review_source_docx_bytes", None)
         return uploaded_file.read().decode("utf-8")
+    if store_source_docx:
+        st.session_state.pop("review_source_docx_bytes", None)
     st.warning("Only .docx and .txt files are supported.")
     return None
 
@@ -301,16 +515,7 @@ def render_contract_review_tab():
     mode = "own_paper"
     generate_issues = True
     generate_word = True
-    preset_options = ["cost", "quality"]
-    current_preset = os.environ.get("MODEL_PRESET", "cost").lower()
-    if current_preset not in preset_options:
-        current_preset = "cost"
-    preset = st.selectbox(
-        "Model Preset",
-        preset_options,
-        index=preset_options.index(current_preset),
-        help="cost 更便宜更兼容；quality 推理更强但依赖更高阶模型。",
-    )
+    preset = "quality"
     os.environ["MODEL_PRESET"] = preset
 
     st.markdown("### 📄 Contract Text")
@@ -318,7 +523,9 @@ def render_contract_review_tab():
         "Upload .docx or .txt (optional)",
         type=["docx", "txt"],
     )
-    uploaded_text = parse_uploaded_contract(uploaded) if uploaded else None
+    uploaded_text = parse_uploaded_contract(uploaded, store_source_docx=True) if uploaded else None
+    if not uploaded:
+        st.session_state.pop("review_source_docx_bytes", None)
 
     contract_text = st.text_area(
         "Contract Text",
@@ -504,7 +711,10 @@ def render_contract_review_tab():
                     final_text,
                     issues_list=issues or None,
                     modifications=modifications or None,
-                    title="Contract Redline",
+                    title=None,
+                    redline_heading=None,
+                    include_issues_list=False,
+                    source_docx_bytes=st.session_state.get("review_source_docx_bytes"),
                 )
                 st.download_button(
                     "📥 Download Redline (.docx)",

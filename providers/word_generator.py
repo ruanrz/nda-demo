@@ -37,7 +37,10 @@ def generate_redline_docx(
     modified_text: str,
     issues_list: Optional[List[Dict[str, Any]]] = None,
     modifications: Optional[List[Dict[str, Any]]] = None,
-    title: str = "Contract Review — Redline",
+    title: Optional[str] = None,
+    redline_heading: Optional[str] = None,
+    include_issues_list: bool = False,
+    source_docx_bytes: Optional[bytes] = None,
 ) -> io.BytesIO:
     """
     Generate a Word document with native Track Changes markup.
@@ -47,28 +50,49 @@ def generate_redline_docx(
         modified_text:  The modified contract text.
         issues_list:    Optional issues list to append as a table.
         modifications:  Optional modification list used for short rationale comments.
-        title:          Document title.
+        title:          Optional document title heading (H1). If None, no title heading.
+        redline_heading: Optional section heading before redlined body (H2). If None, no section heading.
+        include_issues_list: Whether to append Issues List table at the end.
+        source_docx_bytes: Optional original .docx bytes used as template to preserve
+                          paragraph-level styles (including native numbering).
 
     Returns:
         BytesIO buffer containing the .docx file.
     """
-    doc = Document()
+    use_source_template = False
+    if source_docx_bytes:
+        try:
+            doc = Document(io.BytesIO(source_docx_bytes))
+            use_source_template = True
+        except Exception:
+            doc = Document()
+    else:
+        doc = Document()
 
-    # ── Styles ───────────────────────────────────────────────────
-    style = doc.styles["Normal"]
-    font = style.font
-    font.name = "Calibri"
-    font.size = Pt(11)
+    if not use_source_template:
+        # ── Styles ───────────────────────────────────────────────
+        style = doc.styles["Normal"]
+        font = style.font
+        font.name = "Calibri"
+        font.size = Pt(11)
 
-    # ── Title ────────────────────────────────────────────────────
-    doc.add_heading(title, level=1)
+        # ── Optional headings ───────────────────────────────────
+        # Keep disabled by default so exported redline mirrors contract structure.
+        if title:
+            doc.add_heading(title, level=1)
+        if redline_heading:
+            doc.add_heading(redline_heading, level=2)
 
-    # ── Redline body ─────────────────────────────────────────────
-    doc.add_heading("Redlined Contract", level=2)
-    _add_redline_paragraphs(doc, original_text, modified_text, modifications or [])
+        # ── Redline body (plain mode) ───────────────────────────
+        _add_redline_paragraphs(doc, original_text, modified_text, modifications or [])
+    else:
+        # ── Redline body (template mode; keeps paragraph properties) ──
+        _add_redline_paragraphs_from_template(
+            doc, original_text, modified_text, modifications or []
+        )
 
     # ── Issues List table ────────────────────────────────────────
-    if issues_list:
+    if include_issues_list and issues_list:
         doc.add_page_break()
         doc.add_heading("Issues List", level=2)
         _add_issues_table(doc, issues_list)
@@ -234,6 +258,98 @@ def _add_redline_paragraphs(
 
     for orig_p, mod_p in zip(orig_paras, mod_paras):
         para = doc.add_paragraph()
+        _clear_paragraph_content(para)
+        if orig_p == mod_p:
+            run = para.add_run(orig_p)
+            run.font.color.rgb = _BLACK
+            continue
+
+        diffs = _compute_diffs(orig_p, mod_p)
+        comment_anchor: Optional[Run] = None
+        comment_reason = ""
+        for op, text in diffs:
+            if not text:
+                continue
+            if op == dmp_module.diff_match_patch.DIFF_EQUAL:
+                run = para.add_run(text)
+                run.font.color.rgb = _BLACK
+                if comment_anchor is None:
+                    comment_anchor = run
+            elif op == dmp_module.diff_match_patch.DIFF_DELETE:
+                deleted_run = _append_tracked_delete(
+                    para=para,
+                    text=text,
+                    revision_id=revision_id,
+                    author=author,
+                    date_iso=date_iso,
+                )
+                revision_id += 1
+                if comment_anchor is None and deleted_run is not None:
+                    comment_anchor = deleted_run
+                if not comment_reason:
+                    comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications)
+            elif op == dmp_module.diff_match_patch.DIFF_INSERT:
+                inserted_run = _append_tracked_insert(
+                    para=para,
+                    text=text,
+                    revision_id=revision_id,
+                    author=author,
+                    date_iso=date_iso,
+                )
+                revision_id += 1
+                if comment_anchor is None and inserted_run is not None:
+                    comment_anchor = inserted_run
+                if not comment_reason:
+                    comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications)
+
+        if not comment_reason:
+            comment_reason = "Aligned this edit with the selected playbook requirement."
+        if comment_anchor is not None:
+            _try_add_comment(doc, comment_anchor, _short_reason(comment_reason))
+
+
+def _clear_paragraph_content(para: Paragraph) -> None:
+    """Remove runs/revisions while preserving paragraph properties (w:pPr)."""
+    p_elm = para._p
+    for child in list(p_elm):
+        if child.tag != qn("w:pPr"):
+            p_elm.remove(child)
+
+
+def _split_contract_paragraphs(text: str) -> List[str]:
+    return [p.strip() for p in text.split("\n\n") if p.strip()]
+
+
+def _add_redline_paragraphs_from_template(
+    doc: Document,
+    original: str,
+    modified: str,
+    modifications: List[Dict[str, Any]],
+):
+    """
+    Rewrite the source document's existing paragraphs so paragraph-level formatting
+    (including native numbering) is preserved in output.
+    """
+    orig_paras = _split_contract_paragraphs(original)
+    mod_paras = _split_contract_paragraphs(modified)
+    target_count = max(len(orig_paras), len(mod_paras))
+    if target_count == 0:
+        return
+
+    existing_paras = [p for p in doc.paragraphs if (p.text or "").strip()]
+    while len(existing_paras) < target_count:
+        existing_paras.append(doc.add_paragraph())
+
+    author = "AI Legal Assistant"
+    revision_id = 1
+    date_iso = _iso_now_utc()
+
+    for idx in range(target_count):
+        para = existing_paras[idx]
+        orig_p = orig_paras[idx] if idx < len(orig_paras) else ""
+        mod_p = mod_paras[idx] if idx < len(mod_paras) else ""
+
+        _clear_paragraph_content(para)
         if orig_p == mod_p:
             run = para.add_run(orig_p)
             run.font.color.rgb = _BLACK

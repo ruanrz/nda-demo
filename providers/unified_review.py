@@ -16,6 +16,7 @@ See llm_client.py for routing details.
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -141,7 +142,7 @@ def unified_review_contract(
             mode_instruction=mode_instruction,
         ),
         temperature=0.0,
-        max_tokens=8192,
+        max_tokens=16384,
     )
 
     analysis_items = analysis_result.get("analysis", [])
@@ -233,18 +234,22 @@ def unified_review_contract(
                 task_type="execution",
                 system_prompt=EXECUTION_SYSTEM_PROMPT,
                 user_prompt=EXECUTION_USER_PROMPT.format(
-                    modifications_json=json.dumps(mods_for_prompt, ensure_ascii=False, indent=2),
-                    original_text=contract_text,
+                    modifications_json=json.dumps(failed, ensure_ascii=False, indent=2),
+                    original_text=local_text,
                 ),
                 temperature=0.0,
-                max_tokens=8192,
+                max_tokens=16384,
             )
 
-            result["modifications"] = exec_result.get("modifications_applied", [])
-            result["final_text"] = exec_result.get("final_text", contract_text)
+            llm_mods = exec_result.get("modifications_applied", [])
+            result["modifications"] = applied + llm_mods
+            result["final_text"] = exec_result.get("final_text", local_text)
 
             verification = exec_result.get("verification", {})
-            exec_thinking = []
+            exec_thinking = [
+                f"Local find/replace succeeded for {len(applied)} modifications.",
+                f"LLM fallback handled remaining {len(failed)} modifications.",
+            ]
             for mod in result["modifications"][:6]:
                 why = mod.get("explanation", "")
                 title = mod.get("rule_title", mod.get("rule_id", "Rule"))
@@ -252,18 +257,17 @@ def unified_review_contract(
                     exec_thinking.append(f"{title}: {why}")
                 else:
                     exec_thinking.append(f"{title}: change applied.")
-            if not exec_thinking:
-                exec_thinking.append("Execution fallback ran; see verification counters below.")
             result["step_trace"].append({
                 "step": "Step 2",
                 "name": "Execution",
-                "engine": f"LLM fallback ({client.routing.get('execution', 'default')})",
+                "engine": f"Local + LLM fallback ({client.routing.get('execution', 'default')})",
                 "thinking": exec_thinking,
                 "output": {
-                    "planned": verification.get("total_planned", len(mods_for_prompt)),
-                    "applied": verification.get("total_applied", len(result["modifications"])),
+                    "planned": len(mods_for_prompt),
+                    "applied_local": len(applied),
+                    "applied_llm": len(llm_mods),
+                    "applied_total": len(result["modifications"]),
                     "fallback_used": True,
-                    "failed_local_matches": len(failed),
                 },
             })
             logger.info(
@@ -298,10 +302,11 @@ def unified_review_contract(
             user_prompt=ISSUES_LIST_USER_PROMPT.format(
                 analysis_json=json.dumps(result["analysis"], ensure_ascii=False, indent=2),
                 modifications_json=json.dumps(result["modifications"], ensure_ascii=False, indent=2),
+                final_text=result["final_text"],
                 mode_context=mode_ctx,
             ),
             temperature=0.0,
-            max_tokens=4096,
+            max_tokens=8192,
         )
 
         result["issues_list"] = issues_result.get("issues", [])
@@ -340,6 +345,19 @@ def unified_review_contract(
 
 # ─── Helpers ─────────────────────────────────────────────────────
 
+_PUNCT_MAP = str.maketrans({
+    '\u201c': '"', '\u201d': '"',   # curly double quotes → straight
+    '\u2018': "'", '\u2019': "'",   # curly single quotes → straight
+    '\u2014': '-', '\u2013': '-',   # em-dash / en-dash → hyphen
+    '\u00a0': ' ',                  # non-breaking space → space
+})
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize whitespace and common punctuation variants for matching."""
+    return re.sub(r'\s+', ' ', text.translate(_PUNCT_MAP)).strip()
+
+
 def _local_find_replace(
     text: str,
     modifications: List[Dict[str, Any]],
@@ -350,6 +368,12 @@ def _local_find_replace(
     Returns (modified_text, applied_list, failed_list).
     - applied_list: modifications that succeeded locally.
     - failed_list:  modifications where find_text was not found (need LLM fallback).
+
+    Matching strategy:
+      1. Exact substring match (preferred).
+      2. Normalized flexible match — normalizes whitespace and punctuation variants
+         (curly quotes, em-dashes, non-breaking spaces, etc.) then builds a regex
+         that tolerates variable whitespace between words.
     """
     applied: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
@@ -362,19 +386,46 @@ def _local_find_replace(
             failed.append(mod)
             continue
 
+        success_record = {
+            "rule_id": mod.get("rule_id", ""),
+            "rule_title": mod.get("rule_title", ""),
+            "original_fragment": find,
+            "modified_fragment": replace,
+            "modification_type": mod.get("type", "replace"),
+            "explanation": mod.get("description", "Applied via local find/replace"),
+            "severity": "P1",
+        }
+
         if find in current:
             current = current.replace(find, replace, 1)
-            applied.append({
-                "rule_id": mod.get("rule_id", ""),
-                "rule_title": mod.get("rule_title", ""),
-                "original_fragment": find,
-                "modified_fragment": replace,
-                "modification_type": mod.get("type", "replace"),
-                "explanation": mod.get("description", "Applied via local find/replace"),
-                "severity": "P1",
-            })
-        else:
+            applied.append(success_record)
+            continue
+
+        norm_find = _normalize_text(find)
+        if not norm_find:
             failed.append(mod)
+            continue
+
+        escaped_words = [re.escape(w) for w in norm_find.split()]
+        flex_pattern = r'\s+'.join(escaped_words)
+        match = re.search(flex_pattern, current)
+        if match:
+            current = current[:match.start()] + replace + current[match.end():]
+            success_record["original_fragment"] = match.group(0)
+            success_record["explanation"] += " (normalized match)"
+            applied.append(success_record)
+            continue
+
+        punct_current = current.translate(_PUNCT_MAP)
+        match = re.search(flex_pattern, punct_current)
+        if match:
+            success_record["original_fragment"] = current[match.start():match.end()]
+            current = current[:match.start()] + replace + current[match.end():]
+            success_record["explanation"] += " (punctuation-normalized match)"
+            applied.append(success_record)
+            continue
+
+        failed.append(mod)
 
     return current, applied, failed
 
