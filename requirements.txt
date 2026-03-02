@@ -1,0 +1,4 @@
+streamlit
+diff-match-patch
+openai
+python-docx

@@ -1,0 +1,127 @@
+{
+  "rule_id": "4",
+  "rule_name": "Compelled Disclosure",
+  "description": "强制披露条款测试样例 - 基于真实NDA合同文本",
+  "regulatory_exception_clause": "Notwithstanding the foregoing, Confidential Information may be disclosed, and no notice as referenced above is required to be provided, pursuant to requests for information in connection with routine supervisory examinations by regulatory authorities with the jurisdiction over you or your Representatives and not directed at the disclosing party or the Potential Transaction; provided that you or your Representatives, as applicable, inform any such authority of the confidential nature of the information disclosed to them and to keep such information confidential in accordance with such authority's policies and procedures.",
+  "test_cases": [
+    {
+      "test_id": "TC4-01",
+      "name": "真实合同原文 - 完整强制披露条款（修改前）",
+      "description": "图片中被删除线标记的原始条款，包含完整的强制披露程序义务",
+      "source": "Sample NDA 真实合同",
+      "conditions": {
+        "cond_1": true,
+        "cond_2": true,
+        "cond_3": true
+      },
+      "input": "You shall be responsible for any breach of the terms of this agreement by your Representatives. If you or any of your Representatives is required (by deposition, interrogatory, request for documents, subpoena, civil investigative demand or similar process) to disclose any of the Evaluation Material, you shall provide the Company with written notice of such requirement as soon as practicable after learning of it, shall furnish only that portion of the Evaluation Material which you are advised by written opinion of counsel is legally required and only in the manner legally required, and shall exercise best efforts to obtain assurance that confidential treatment will be accorded such Evaluation Material. In addition, you acknowledge that the Company may also take steps as it deems necessary to obtain such assurance.",
+      "expected_actions": [
+        "添加监管审查例外条款（因存在通知要求 cond_3=true）"
+      ],
+      "expected_output": "You shall be responsible for any breach of the terms of this agreement by your Representatives. If you or any of your Representatives is required (by deposition, interrogatory, request for documents, subpoena, civil investigative demand or similar process) to disclose any of the Evaluation Material, you shall provide the Company with written notice of such requirement as soon as practicable after learning of it, shall furnish only that portion of the Evaluation Material which you are advised by written opinion of counsel is legally required and only in the manner legally required, and shall exercise best efforts to obtain assurance that confidential treatment will be accorded such Evaluation Material. In addition, you acknowledge that the Company may also take steps as it deems necessary to obtain such assurance. Notwithstanding the foregoing, Confidential Information may be disclosed, and no notice as referenced above is required to be provided, pursuant to requests for information in connection with routine supervisory examinations by regulatory authorities with the jurisdiction over you or your Representatives and not directed at the disclosing party or the Potential Transaction; provided that you or your Representatives, as applicable, inform any such authority of the confidential nature of the information disclosed to them and to keep such information confidential in accordance with such authority's policies and procedures."
+    },
+    {
+      "test_id": "TC4-02",
+      "name": "真实合同修改后 - 强制披露条款被完全删除",
+      "description": "图片中修改后的版本，整个强制披露条款被删除，仅保留责任条款",
+      "source": "Sample NDA 真实合同（修改后）",
+      "conditions": {
+        "clause_exists": false
+      },
+      "input": "You shall be responsible for any breach of this agreement that are applicable to Representatives by your Representatives, except for any Representative that (i) enters into a separate agreement in a form similar to this agreement in substance for the benefit of the Company or (ii) executes a separate confidentiality agreement with the Company relating to the possible transaction.",
+      "expected_actions": [
+        "规则4不触发（无强制披露条款）"
+      ],
+      "expected_output": "You shall be responsible for any breach of this agreement that are applicable to Representatives by your Representatives, except for any Representative that (i) enters into a separate agreement in a form similar to this agreement in substance for the benefit of the Company or (ii) executes a separate confidentiality agreement with the Company relating to the possible transaction."
+    },
+    {
+      "test_id": "TC4-03",
+      "name": "简化版 - 仅覆盖 'you' 未明确提及 Representatives",
+      "description": "基于真实合同，但移除了 Representatives 部分",
+      "source": "基于真实合同改编",
+      "conditions": {
+        "cond_1": false,
+        "cond_2": true,
+        "cond_3": true
+      },
+      "input": "If you are required (by deposition, interrogatory, request for documents, subpoena, civil investigative demand or similar process) to disclose any of the Evaluation Material, you shall provide the Company with written notice of such requirement as soon as practicable after learning of it.",
+      "expected_actions": [
+        "补充覆盖 Representatives",
+        "添加监管审查例外条款"
+      ],
+      "expected_output": "If you or any of your Representatives are required (by deposition, interrogatory, request for documents, subpoena, civil investigative demand or similar process) to disclose any of the Evaluation Material, you shall provide the Company with written notice of such requirement as soon as practicable after learning of it. Notwithstanding the foregoing, Confidential Information may be disclosed, and no notice as referenced above is required to be provided, pursuant to requests for information in connection with routine supervisory examinations by regulatory authorities with the jurisdiction over you or your Representatives and not directed at the disclosing party or the Potential Transaction; provided that you or your Representatives, as applicable, inform any such authority of the confidential nature of the information disclosed to them and to keep such information confidential in accordance with such authority's policies and procedures."
+    },
+    {
+      "test_id": "TC4-04",
+      "name": "简化版 - 仅说 'required by law'",
+      "description": "条款简化，仅说 required by law，缺少详细法律情形列举",
+      "source": "基于真实合同改编",
+      "conditions": {
+        "cond_1": true,
+        "cond_2": false,
+        "cond_3": true
+      },
+      "input": "If you or any of your Representatives is required by law to disclose any of the Evaluation Material, you shall provide the Company with written notice of such requirement as soon as practicable.",
+      "expected_actions": [
+        "补充完整法律情形",
+        "添加监管审查例外条款"
+      ],
+      "expected_output": "If you or any of your Representatives is requested or required by law, regulation, order and legal process to disclose any of the Evaluation Material, you shall provide the Company with written notice of such requirement as soon as practicable. Notwithstanding the foregoing, Confidential Information may be disclosed, and no notice as referenced above is required to be provided, pursuant to requests for information in connection with routine supervisory examinations by regulatory authorities with the jurisdiction over you or your Representatives and not directed at the disclosing party or the Potential Transaction; provided that you or your Representatives, as applicable, inform any such authority of the confidential nature of the information disclosed to them and to keep such information confidential in accordance with such authority's policies and procedures."
+    },
+    {
+      "test_id": "TC4-05",
+      "name": "宽松版 - 无通知要求",
+      "description": "条款允许强制披露但不要求事先通知公司",
+      "source": "基于真实合同改编",
+      "conditions": {
+        "cond_1": true,
+        "cond_2": true,
+        "cond_3": false
+      },
+      "input": "If you or any of your Representatives is required (by deposition, interrogatory, request for documents, subpoena, civil investigative demand or similar process) to disclose any of the Evaluation Material, such disclosure shall not constitute a breach of this agreement.",
+      "expected_actions": [
+        "不添加监管审查例外条款（现有条款不要求通知）"
+      ],
+      "expected_output": "If you or any of your Representatives is required (by deposition, interrogatory, request for documents, subpoena, civil investigative demand or similar process) to disclose any of the Evaluation Material, such disclosure shall not constitute a breach of this agreement."
+    },
+    {
+      "test_id": "TC4-06",
+      "name": "使用 Recipient 术语的标准化表述",
+      "description": "使用标准法律术语 Recipient 而非 you",
+      "source": "标准化NDA模板",
+      "conditions": {
+        "cond_1": true,
+        "cond_2": true,
+        "cond_3": true
+      },
+      "input": "If the Recipient or its Representatives is requested or required by law, regulation, order and legal process to disclose any Confidential Information, the Recipient shall provide prior written notice to the Disclosing Party promptly upon becoming aware of such requirement.",
+      "expected_actions": [
+        "添加监管审查例外条款"
+      ],
+      "expected_output": "If the Recipient or its Representatives is requested or required by law, regulation, order and legal process to disclose any Confidential Information, the Recipient shall provide prior written notice to the Disclosing Party promptly upon becoming aware of such requirement. Notwithstanding the foregoing, Confidential Information may be disclosed, and no notice as referenced above is required to be provided, pursuant to requests for information in connection with routine supervisory examinations by regulatory authorities with the jurisdiction over you or your Representatives and not directed at the disclosing party or the Potential Transaction; provided that you or your Representatives, as applicable, inform any such authority of the confidential nature of the information disclosed to them and to keep such information confidential in accordance with such authority's policies and procedures."
+    },
+    {
+      "test_id": "TC4-07",
+      "name": "全部缺失 - 最简条款",
+      "description": "极简的强制披露条款，缺少 Representatives、详细法律情形、无通知要求",
+      "source": "简化合同模板",
+      "conditions": {
+        "cond_1": false,
+        "cond_2": false,
+        "cond_3": false
+      },
+      "input": "The Recipient may disclose Confidential Information if required by law.",
+      "expected_actions": [
+        "补充覆盖 Representatives",
+        "补充完整法律情形",
+        "不添加监管审查例外条款（无通知要求）"
+      ],
+      "expected_output": "The Recipient or its Representatives may disclose Confidential Information if requested or required by law, regulation, order and legal process."
+    }
+  ],
+  "metadata": {
+    "created_at": "2026-01-08",
+    "based_on": "真实NDA合同样本（Sample NDA）",
+    "total_test_cases": 7
+  }
+}

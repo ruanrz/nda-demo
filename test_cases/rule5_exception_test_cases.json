@@ -1,0 +1,200 @@
+{
+  "rule_id": "5",
+  "rule_name": "Exception to Confidential Information",
+  "rule_type": "checklist_with_conditions",
+  "description": "保密信息例外条款检查 - 确保包含所有必要的例外类型,并根据现有条款特征进行适当修改",
+  "sub_rules": [
+    {
+      "sub_rule_id": "rule_exception_general",
+      "name": "一般要求检查",
+      "description": "确保包含5类基本例外并覆盖Recipient和Representatives"
+    },
+    {
+      "sub_rule_id": "rule_exception_public",
+      "name": "公开信息例外",
+      "description": "必须包含'generally available to the public'术语"
+    },
+    {
+      "sub_rule_id": "rule_exception_third_party",
+      "name": "第三方来源信息例外",
+      "description": "来自第三方的信息,需检查第三方未违反保密义务"
+    },
+    {
+      "sub_rule_id": "rule_exception_independent",
+      "name": "独立开发信息例外",
+      "description": "简化限制,只保留'without use of'"
+    },
+    {
+      "sub_rule_id": "rule_exception_remove_lawfully",
+      "name": "删除lawfully修饰词",
+      "description": "将'lawfully'改为客观标准"
+    },
+    {
+      "sub_rule_id": "rule_exception_fault_to_disclosure",
+      "name": "替换no fault为no disclosure",
+      "description": "将主观判断标准改为客观事实标准"
+    }
+  ],
+  "test_cases": [
+    {
+      "test_id": "TC5-01",
+      "name": "完整例外条款 - 仅需删除lawfully",
+      "sub_rules_triggered": ["rule_exception_remove_lawfully"],
+      "input": "Confidential Information shall not include information that: (a) was lawfully in the possession of you or any of your Representatives prior to its disclosure to you by the Company; (b) is or becomes generally available to the public other than as a result of a disclosure by you or your Representatives in breach of this Agreement; (c) becomes available to you or your Representatives from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information; (d) was or is independently developed by or for you or your Representatives without use of Confidential Information; or (e) is approved for release by written authorization of the Company.",
+      "expected_output": "Confidential Information shall not include information that: (a) was in the possession of you or any of your Representatives prior to its disclosure to you by the Company; (b) is or becomes generally available to the public other than as a result of a disclosure by you or your Representatives in breach of this Agreement; (c) becomes available to you or your Representatives from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information; (d) was or is independently developed by or for you or your Representatives without use of Confidential Information; or (e) is approved for release by written authorization of the Company.",
+      "expected_action": "删除(a)中的'lawfully'"
+    },
+    {
+      "test_id": "TC5-02",
+      "name": "缺少'generally available to the public'术语",
+      "sub_rules_triggered": ["rule_exception_public"],
+      "input": "Confidential Information shall not include information that: (a) was in your possession prior to disclosure; (b) is publicly available; (c) becomes available from a third party source; (d) is independently developed; or (e) is approved for release.",
+      "expected_output": "Confidential Information shall not include information that: (a) was in your possession prior to disclosure; (b) is or becomes generally available to the public; (c) becomes available from a third party source; (d) is independently developed; or (e) is approved for release.",
+      "expected_action": "将(b)中的'publicly available'改为'generally available to the public'"
+    },
+    {
+      "test_id": "TC5-03",
+      "name": "公开信息例外缺少Recipient违反限定",
+      "sub_rules_triggered": ["rule_exception_public"],
+      "input": "Confidential Information shall not include information that: (a) is or becomes generally available to the public; (b) was in the possession of Recipient prior to disclosure; (c) is independently developed without use of Confidential Information.",
+      "expected_output": "Confidential Information shall not include information that: (a) is or becomes generally available to the public; (b) was in the possession of Recipient prior to disclosure; (c) is independently developed without use of Confidential Information.",
+      "expected_action": "已有'generally available to the public',但无违反限定,根据规则不主动添加"
+    },
+    {
+      "test_id": "TC5-04",
+      "name": "第三方来源例外 - 缺少三个必要条件",
+      "sub_rules_triggered": ["rule_exception_third_party"],
+      "input": "Confidential Information shall not include information that: (a) is generally available to the public; (b) becomes available to Recipient from a third party source; (c) is independently developed.",
+      "expected_output": "Confidential Information shall not include information that: (a) is generally available to the public; (b) becomes available to you or your Representatives from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information; (c) is independently developed.",
+      "expected_action": "补充第三方来源的完整限定条件"
+    },
+    {
+      "test_id": "TC5-05",
+      "name": "独立开发例外 - 需要简化限制",
+      "sub_rules_triggered": ["rule_exception_independent"],
+      "input": "Confidential Information shall not include information that: (a) is generally available to the public; (b) was independently developed by Recipient without use of, reference to, or based upon Confidential Information; (c) was in possession prior to disclosure.",
+      "expected_output": "Confidential Information shall not include information that: (a) is generally available to the public; (b) was or is independently developed by or for you or your Representatives without use of Confidential Information; (c) was in possession prior to disclosure.",
+      "expected_action": "简化(b),删除'reference to'和'based upon',只保留'without use of'"
+    },
+    {
+      "test_id": "TC5-06",
+      "name": "使用'no fault'表述 - 需替换为'no disclosure'",
+      "sub_rules_triggered": ["rule_exception_fault_to_disclosure"],
+      "input": "Confidential Information shall not include information that: (a) becomes generally available to the public through no fault of you or any of your Representatives in breach of this agreement; (b) was in your possession prior to disclosure; (c) is independently developed.",
+      "expected_output": "Confidential Information shall not include information that: (a) is or becomes generally available to the public through no disclosure by you or any of your Representatives in breach of this agreement; (b) was in your possession prior to disclosure; (c) is independently developed.",
+      "expected_action": "将'through no fault of'改为'through no disclosure by',并确保'is or becomes'"
+    },
+    {
+      "test_id": "TC5-07",
+      "name": "真实合同 - 多个问题综合",
+      "source": "Sample NDA",
+      "sub_rules_triggered": ["rule_exception_remove_lawfully", "rule_exception_independent"],
+      "input": "The term \"Confidential Information\" does not include information which: (i) was lawfully in the possession of the Recipient or its Representatives at the time of disclosure as shown by the Recipient's files and records immediately prior to the time of disclosure; (ii) is or becomes generally available to the public other than as a result of a disclosure by the Recipient or its Representatives in breach of this Agreement; (iii) becomes available to the Recipient on a non-confidential basis from a source other than the Disclosing Party; (iv) was independently developed by the Recipient without use of, reference to, reliance on or derived from the Confidential Information.",
+      "expected_output": "The term \"Confidential Information\" does not include information which: (i) was in the possession of you or your Representatives at the time of disclosure as shown by your files and records immediately prior to the time of disclosure; (ii) is or becomes generally available to the public other than as a result of a disclosure by you or your Representatives in breach of this Agreement; (iii) becomes available to you or your Representatives on a non-confidential basis from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information; (iv) was or is independently developed by or for you or your Representatives without use of the Confidential Information.",
+      "expected_action": "删除(i)中的'lawfully'; 简化(iv)的限制,删除'reference to, reliance on or derived from'; 补充(iii)的第三方限定条件"
+    },
+    {
+      "test_id": "TC5-08",
+      "name": "仅覆盖Recipient,缺少Representatives",
+      "sub_rules_triggered": ["rule_exception_general"],
+      "input": "Confidential Information shall not include information that: (a) was in the possession of Recipient prior to disclosure; (b) is generally available to the public; (c) becomes available to Recipient from a third party; (d) is independently developed by Recipient; (e) is approved for release.",
+      "expected_output": "Confidential Information shall not include information that: (a) was in the possession of you or your Representatives prior to disclosure; (b) is or becomes generally available to the public; (c) becomes available to you or your Representatives from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information; (d) was or is independently developed by or for you or your Representatives without use of Confidential Information; (e) is approved for release by written authorization of the Company.",
+      "expected_action": "确保所有例外都覆盖'you or your Representatives'"
+    },
+    {
+      "test_id": "TC5-09",
+      "name": "缺少基本例外类型",
+      "sub_rules_triggered": ["rule_exception_general"],
+      "input": "Confidential Information shall not include information that: (a) is publicly available; (b) was in Recipient's possession prior to disclosure.",
+      "expected_output": "Confidential Information shall not include information that: (a) is or becomes generally available to the public other than as a result of a disclosure by you or your Representatives in breach of this Agreement; (b) was in the possession of you or your Representatives prior to its disclosure to you by the Company; (c) becomes available to you or your Representatives from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information; (d) was or is independently developed by or for you or your Representatives without use of Confidential Information; (e) is approved for release by written authorization of the Company.",
+      "expected_action": "补充缺失的第三方来源、独立开发、批准发布三个例外"
+    },
+    {
+      "test_id": "TC5-10",
+      "name": "第三方例外 - 缺少'was not known'条件",
+      "sub_rules_triggered": ["rule_exception_third_party"],
+      "input": "Confidential Information shall not include information that becomes available to you from a source other than the Company; provided that such source did not breach confidentiality obligations owed to the Company with respect to such information.",
+      "expected_output": "Confidential Information shall not include information that becomes available to you or your Representatives from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information.",
+      "expected_action": "补充'was not known by you or your Representatives'主观知情要件"
+    },
+    {
+      "test_id": "TC5-11",
+      "name": "已完整且符合要求 - 无需修改",
+      "sub_rules_triggered": [],
+      "input": "Confidential Information shall not include information that: (a) was in the possession of you or any of your Representatives prior to its disclosure to you by the Company; (b) is or becomes generally available to the public other than as a result of a disclosure by you or your Representatives in breach of this Agreement; (c) becomes available to you or your Representatives from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information; (d) was or is independently developed by or for you or your Representatives without use of Confidential Information; (e) is approved for release by written authorization of the Company.",
+      "expected_output": "Confidential Information shall not include information that: (a) was in the possession of you or any of your Representatives prior to its disclosure to you by the Company; (b) is or becomes generally available to the public other than as a result of a disclosure by you or your Representatives in breach of this Agreement; (c) becomes available to you or your Representatives from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information; (d) was or is independently developed by or for you or your Representatives without use of Confidential Information; (e) is approved for release by written authorization of the Company.",
+      "expected_action": "已完整且符合所有要求,无需修改"
+    },
+    {
+      "test_id": "TC5-12",
+      "name": "lawfully出现在多处",
+      "sub_rules_triggered": ["rule_exception_remove_lawfully"],
+      "input": "Confidential Information shall not include information that: (a) was lawfully received by Recipient from a third party; (b) was lawfully in Recipient's possession prior to disclosure; (c) is generally available to the public.",
+      "expected_output": "Confidential Information shall not include information that: (a) was received by you or your Representatives from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information; (b) was in the possession of you or your Representatives prior to disclosure by the Company; (c) is or becomes generally available to the public.",
+      "expected_action": "删除所有'lawfully',并补充完整表述"
+    },
+    {
+      "test_id": "TC5-13",
+      "name": "独立开发 - 仅使用'based upon'",
+      "sub_rules_triggered": ["rule_exception_independent"],
+      "input": "Confidential Information shall not include information that is independently developed by Recipient not based upon any Confidential Information.",
+      "expected_output": "Confidential Information shall not include information that was or is independently developed by or for you or your Representatives without use of Confidential Information.",
+      "expected_action": "将'not based upon'改为'without use of',并补充'was or is'和'by or for you or your Representatives'"
+    },
+    {
+      "test_id": "TC5-14",
+      "name": "真实合同 - 使用carveout限定第三方",
+      "source": "Sample NDA (图片示例)",
+      "sub_rules_triggered": ["rule_exception_third_party"],
+      "input": "becomes available to you or your Representatives from a source other than the Company; [provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information]",
+      "expected_output": "becomes available to you or your Representatives from a source other than the Company; provided that the source of such information was not known by you or your Representatives to have made the disclosure in violation of any confidentiality obligations owed to the Company with respect to such information",
+      "expected_action": "确认第三方例外的carveout包含三个必要条件:1)Recipient知情 2)保密义务对Company 3)针对该信息",
+      "notes": "根据图片说明,如果现有语言使用carveout限定第三方未违反保密义务,必须确保三个条件都具备,且保密义务必须是对Company的,且必须是针对该信息的"
+    },
+    {
+      "test_id": "TC5-15",
+      "name": "无例外条款 - 规则不触发",
+      "sub_rules_triggered": [],
+      "input": "The Recipient agrees to keep all Confidential Information strictly confidential and shall not disclose such information to any third party without prior written consent of the Disclosing Party.",
+      "expected_output": "The Recipient agrees to keep all Confidential Information strictly confidential and shall not disclose such information to any third party without prior written consent of the Disclosing Party.",
+      "expected_action": "无例外条款定义,规则不触发"
+    }
+  ],
+  "test_coverage_summary": {
+    "total_cases": 15,
+    "coverage_by_sub_rule": {
+      "rule_exception_general": 3,
+      "rule_exception_public": 3,
+      "rule_exception_third_party": 4,
+      "rule_exception_independent": 4,
+      "rule_exception_remove_lawfully": 3,
+      "rule_exception_fault_to_disclosure": 1
+    },
+    "scenarios": [
+      "完整条款仅需微调",
+      "缺少必要术语",
+      "缺少Recipient违反限定",
+      "第三方例外不完整",
+      "独立开发需简化",
+      "使用no fault表述",
+      "真实合同综合问题",
+      "缺少Representatives覆盖",
+      "缺少基本例外类型",
+      "第三方缺少主观知情",
+      "已完整无需修改",
+      "多处lawfully",
+      "独立开发使用based upon",
+      "第三方carveout检查",
+      "无例外条款"
+    ]
+  },
+  "key_principles": {
+    "removal_lawfully": "删除'lawfully'是因为这是主观法律判断标准,难以证明,去掉后变为客观标准",
+    "fault_to_disclosure": "将'no fault'改为'no disclosure'是将主观判断改为客观事实,更易于确定",
+    "simplify_independent": "简化独立开发的限制条件,'without use of'已足够,过多限制对Recipient不利",
+    "third_party_three_conditions": "第三方来源例外必须满足三个条件:1)Recipient主观不知情 2)第三方保密义务是对Company的 3)保密义务是针对该信息的",
+    "coverage_both": "所有例外条款都必须同时覆盖'Recipient'和'its Representatives'",
+    "preserve_existing": "如果现有条款包含更多内容,保留不删除",
+    "do_not_add_restriction": "如果现有NDA未提供某些限制(如公开信息的Recipient违反限定),不主动添加"
+  }
+}
