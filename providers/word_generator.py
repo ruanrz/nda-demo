@@ -13,7 +13,9 @@ comment per changed paragraph/revision anchor.
 """
 
 import io
+import re
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import List, Dict, Any, Optional
 
 import diff_match_patch as dmp_module
@@ -30,6 +32,16 @@ _RED = RGBColor(0xCF, 0x22, 0x2E)
 _GREEN = RGBColor(0x1A, 0x7F, 0x37)
 _BLACK = RGBColor(0x00, 0x00, 0x00)
 _GREY = RGBColor(0x66, 0x66, 0x66)
+
+_PARA_PUNCT_MAP = str.maketrans({
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u2014": "-",
+    "\u2013": "-",
+    "\u00a0": " ",
+})
 
 
 def generate_redline_docx(
@@ -258,54 +270,16 @@ def _add_redline_paragraphs(
 
     for orig_p, mod_p in zip(orig_paras, mod_paras):
         para = doc.add_paragraph()
-        _clear_paragraph_content(para)
-        if orig_p == mod_p:
-            run = para.add_run(orig_p)
-            run.font.color.rgb = _BLACK
-            continue
-
-        diffs = _compute_diffs(orig_p, mod_p)
-        comment_anchor: Optional[Run] = None
-        comment_reason = ""
-        for op, text in diffs:
-            if not text:
-                continue
-            if op == dmp_module.diff_match_patch.DIFF_EQUAL:
-                run = para.add_run(text)
-                run.font.color.rgb = _BLACK
-                if comment_anchor is None:
-                    comment_anchor = run
-            elif op == dmp_module.diff_match_patch.DIFF_DELETE:
-                deleted_run = _append_tracked_delete(
-                    para=para,
-                    text=text,
-                    revision_id=revision_id,
-                    author=author,
-                    date_iso=date_iso,
-                )
-                revision_id += 1
-                if comment_anchor is None and deleted_run is not None:
-                    comment_anchor = deleted_run
-                if not comment_reason:
-                    comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications)
-            elif op == dmp_module.diff_match_patch.DIFF_INSERT:
-                inserted_run = _append_tracked_insert(
-                    para=para,
-                    text=text,
-                    revision_id=revision_id,
-                    author=author,
-                    date_iso=date_iso,
-                )
-                revision_id += 1
-                if comment_anchor is None and inserted_run is not None:
-                    comment_anchor = inserted_run
-                if not comment_reason:
-                    comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications)
-
-        if not comment_reason:
-            comment_reason = "Aligned this edit with the selected playbook requirement."
-        if comment_anchor is not None:
-            _try_add_comment(doc, comment_anchor, _short_reason(comment_reason))
+        revision_id = _render_paragraph_diff(
+            doc=doc,
+            para=para,
+            orig_p=orig_p,
+            mod_p=mod_p,
+            modifications=modifications,
+            author=author,
+            revision_id=revision_id,
+            date_iso=date_iso,
+        )
 
 
 def _clear_paragraph_content(para: Paragraph) -> None:
@@ -316,8 +290,94 @@ def _clear_paragraph_content(para: Paragraph) -> None:
             p_elm.remove(child)
 
 
+def _normalize_paragraph_for_alignment(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text.translate(_PARA_PUNCT_MAP)).strip()
+
+
+def _render_paragraph_diff(
+    doc: Document,
+    para: Paragraph,
+    orig_p: str,
+    mod_p: str,
+    modifications: List[Dict[str, Any]],
+    author: str,
+    revision_id: int,
+    date_iso: str,
+) -> int:
+    """
+    Render a paragraph diff into an existing paragraph and return next revision id.
+
+    Important behavior:
+    - If normalized text is effectively equal, keep paragraph clean (no synthetic redline).
+    - Only changed paragraphs get rewritten with ins/del revisions.
+    """
+    _clear_paragraph_content(para)
+
+    if orig_p == mod_p or (
+        _normalize_paragraph_for_alignment(orig_p)
+        == _normalize_paragraph_for_alignment(mod_p)
+    ):
+        if mod_p:
+            run = para.add_run(mod_p)
+            run.font.color.rgb = _BLACK
+        return revision_id
+
+    diffs = _compute_diffs(orig_p, mod_p)
+    comment_anchor: Optional[Run] = None
+    comment_reason = ""
+    for op, text in diffs:
+        if not text:
+            continue
+        if op == dmp_module.diff_match_patch.DIFF_EQUAL:
+            run = para.add_run(text)
+            run.font.color.rgb = _BLACK
+            if comment_anchor is None:
+                comment_anchor = run
+        elif op == dmp_module.diff_match_patch.DIFF_DELETE:
+            deleted_run = _append_tracked_delete(
+                para=para,
+                text=text,
+                revision_id=revision_id,
+                author=author,
+                date_iso=date_iso,
+            )
+            revision_id += 1
+            if comment_anchor is None and deleted_run is not None:
+                comment_anchor = deleted_run
+            if not comment_reason:
+                comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications)
+        elif op == dmp_module.diff_match_patch.DIFF_INSERT:
+            inserted_run = _append_tracked_insert(
+                para=para,
+                text=text,
+                revision_id=revision_id,
+                author=author,
+                date_iso=date_iso,
+            )
+            revision_id += 1
+            if comment_anchor is None and inserted_run is not None:
+                comment_anchor = inserted_run
+            if not comment_reason:
+                comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications)
+
+    if not comment_reason:
+        comment_reason = "Aligned this edit with the selected playbook requirement."
+    if comment_anchor is not None:
+        _try_add_comment(doc, comment_anchor, _short_reason(comment_reason))
+    return revision_id
+
+
 def _split_contract_paragraphs(text: str) -> List[str]:
-    return [p.strip() for p in text.split("\n\n") if p.strip()]
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.strip():
+        return []
+    if "\n\n" in normalized:
+        chunks = re.split(r"\n{2,}", normalized)
+    else:
+        chunks = normalized.split("\n")
+    return [p.strip() for p in chunks if p.strip()]
 
 
 def _add_redline_paragraphs_from_template(
@@ -332,71 +392,121 @@ def _add_redline_paragraphs_from_template(
     """
     orig_paras = _split_contract_paragraphs(original)
     mod_paras = _split_contract_paragraphs(modified)
-    target_count = max(len(orig_paras), len(mod_paras))
-    if target_count == 0:
+    if not orig_paras and not mod_paras:
         return
 
     existing_paras = [p for p in doc.paragraphs if (p.text or "").strip()]
-    while len(existing_paras) < target_count:
+    while len(existing_paras) < len(orig_paras):
         existing_paras.append(doc.add_paragraph())
 
     author = "AI Legal Assistant"
     revision_id = 1
     date_iso = _iso_now_utc()
+    matcher = SequenceMatcher(
+        a=[_normalize_paragraph_for_alignment(p) for p in orig_paras],
+        b=[_normalize_paragraph_for_alignment(p) for p in mod_paras],
+        autojunk=False,
+    )
 
-    for idx in range(target_count):
-        para = existing_paras[idx]
-        orig_p = orig_paras[idx] if idx < len(orig_paras) else ""
-        mod_p = mod_paras[idx] if idx < len(mod_paras) else ""
+    def _insert_before(anchor: Optional[Paragraph], style_source: Optional[Paragraph]) -> Paragraph:
+        if anchor is not None:
+            p = anchor.insert_paragraph_before("")
+        else:
+            p = doc.add_paragraph()
+        if style_source is not None:
+            try:
+                p.style = style_source.style
+            except Exception:
+                pass
+        return p
 
-        _clear_paragraph_content(para)
-        if orig_p == mod_p:
-            run = para.add_run(orig_p)
-            run.font.color.rgb = _BLACK
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            # Keep untouched paragraphs as-is to preserve run-level formatting.
             continue
 
-        diffs = _compute_diffs(orig_p, mod_p)
-        comment_anchor: Optional[Run] = None
-        comment_reason = ""
-        for op, text in diffs:
-            if not text:
-                continue
-            if op == dmp_module.diff_match_patch.DIFF_EQUAL:
-                run = para.add_run(text)
-                run.font.color.rgb = _BLACK
-                if comment_anchor is None:
-                    comment_anchor = run
-            elif op == dmp_module.diff_match_patch.DIFF_DELETE:
-                deleted_run = _append_tracked_delete(
+        if tag == "replace":
+            pair_count = min(i2 - i1, j2 - j1)
+            for offset in range(pair_count):
+                orig_idx = i1 + offset
+                mod_idx = j1 + offset
+                para = existing_paras[orig_idx]
+                revision_id = _render_paragraph_diff(
+                    doc=doc,
                     para=para,
-                    text=text,
-                    revision_id=revision_id,
+                    orig_p=orig_paras[orig_idx],
+                    mod_p=mod_paras[mod_idx],
+                    modifications=modifications,
                     author=author,
+                    revision_id=revision_id,
                     date_iso=date_iso,
                 )
-                revision_id += 1
-                if comment_anchor is None and deleted_run is not None:
-                    comment_anchor = deleted_run
-                if not comment_reason:
-                    comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications)
-            elif op == dmp_module.diff_match_patch.DIFF_INSERT:
-                inserted_run = _append_tracked_insert(
-                    para=para,
-                    text=text,
-                    revision_id=revision_id,
-                    author=author,
-                    date_iso=date_iso,
-                )
-                revision_id += 1
-                if comment_anchor is None and inserted_run is not None:
-                    comment_anchor = inserted_run
-                if not comment_reason:
-                    comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications)
 
-        if not comment_reason:
-            comment_reason = "Aligned this edit with the selected playbook requirement."
-        if comment_anchor is not None:
-            _try_add_comment(doc, comment_anchor, _short_reason(comment_reason))
+            for orig_idx in range(i1 + pair_count, i2):
+                para = existing_paras[orig_idx]
+                revision_id = _render_paragraph_diff(
+                    doc=doc,
+                    para=para,
+                    orig_p=orig_paras[orig_idx],
+                    mod_p="",
+                    modifications=modifications,
+                    author=author,
+                    revision_id=revision_id,
+                    date_iso=date_iso,
+                )
+
+            if j1 + pair_count < j2:
+                anchor_idx = i1 + pair_count
+                anchor = existing_paras[anchor_idx] if anchor_idx < len(existing_paras) else None
+                style_source = (
+                    anchor
+                    if anchor is not None
+                    else (existing_paras[anchor_idx - 1] if anchor_idx > 0 else None)
+                )
+                for mod_idx in range(j1 + pair_count, j2):
+                    para = _insert_before(anchor=anchor, style_source=style_source)
+                    revision_id = _render_paragraph_diff(
+                        doc=doc,
+                        para=para,
+                        orig_p="",
+                        mod_p=mod_paras[mod_idx],
+                        modifications=modifications,
+                        author=author,
+                        revision_id=revision_id,
+                        date_iso=date_iso,
+                    )
+            continue
+
+        if tag == "delete":
+            for orig_idx in range(i1, i2):
+                para = existing_paras[orig_idx]
+                revision_id = _render_paragraph_diff(
+                    doc=doc,
+                    para=para,
+                    orig_p=orig_paras[orig_idx],
+                    mod_p="",
+                    modifications=modifications,
+                    author=author,
+                    revision_id=revision_id,
+                    date_iso=date_iso,
+                )
+            continue
+
+        if tag == "insert":
+            anchor = existing_paras[i1] if i1 < len(existing_paras) else None
+            style_source = anchor if anchor is not None else (existing_paras[i1 - 1] if i1 > 0 else None)
+            for mod_idx in range(j1, j2):
+                para = _insert_before(anchor=anchor, style_source=style_source)
+                revision_id = _render_paragraph_diff(
+                    doc=doc,
+                    para=para,
+                    orig_p="",
+                    mod_p=mod_paras[mod_idx],
+                    modifications=modifications,
+                    author=author,
+                    revision_id=revision_id,
+                    date_iso=date_iso,
+                )
 
 
 def _short_reason(reason: str, max_len: int = 160) -> str:
