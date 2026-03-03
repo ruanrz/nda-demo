@@ -4,11 +4,8 @@ Playbook loader — reads playbooks from Markdown files.
 
 Each .md file in the playbooks/ directory represents one playbook entry.
 YAML frontmatter (between --- delimiters) contains metadata.
-The Markdown body contains the human-readable rules that are passed
-directly into the LLM prompt.
-
-This replaces the old JSON-based playbook with a more maintainable,
-version-control-friendly format.
+The Markdown body contains the full rule content (rationale, logic schema,
+examples, strategic reasoning) that is passed directly into the LLM prompt.
 """
 
 import os
@@ -85,7 +82,7 @@ def load_playbooks_from_markdown(
             entries.append({
                 "id": entry_id,
                 "title": meta.get("title", md_file.stem),
-                "type": meta.get("type", "add_text"),
+                "type": meta.get("type", "rule"),
                 "enabled": meta.get("enabled", True),
                 "document_type": meta.get("document_type", "NDA"),
                 "priority": meta.get("priority", "P1"),
@@ -102,14 +99,77 @@ def load_playbooks_from_markdown(
 
 def format_markdown_playbooks_for_prompt(entries: List[Dict[str, Any]]) -> str:
     """
-    Concatenate all playbook Markdown bodies into a single text block
-    suitable for LLM prompt injection.
+    Format playbook entries for LLM prompt injection with intent-driven ordering.
+
+    Restructures each playbook's content so the LLM sees:
+      1. INTENT/RATIONALE — why this rule exists (legal/business reasoning)
+      2. REQUIREMENTS — what specifically needs to change
+      3. REFERENCE — polished examples and AI processing guidance
     """
     sections = []
     for entry in entries:
-        header = f"═══ PLAYBOOK {entry['id']}: {entry['title']} (type={entry['type']}, priority={entry['priority']}) ═══"
-        sections.append(f"{header}\n\n{entry['markdown_body']}")
+        header = f"═══ RULE: {entry['title']} (id={entry['id']}) ═══"
+        body = reorder_playbook_sections(entry.get("markdown_body", ""))
+        sections.append(f"{header}\n\n{body}")
     return "\n\n" + "\n\n".join(sections) + "\n"
+
+
+# ── Section classification patterns ─────────────────────────────
+
+_INTENT_RE = re.compile(
+    r"(rationale|why|objective|strategic|purpose|reasoning)",
+    re.IGNORECASE,
+)
+_REFERENCE_RE = re.compile(
+    r"(example|polished|ai[- ]friendly|ai[- ]optimized|schema)",
+    re.IGNORECASE,
+)
+
+
+def reorder_playbook_sections(markdown_body: str) -> str:
+    """
+    Reorder a playbook's markdown sections: intent/rationale first, then
+    rules/requirements, then examples/reference.  Preserves all content.
+    """
+    if not markdown_body or not markdown_body.strip():
+        return markdown_body
+
+    parts = re.split(r"(?=^## )", markdown_body.strip(), flags=re.MULTILINE)
+
+    preamble = ""
+    sections: List[tuple] = []
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("## "):
+            heading = part.split("\n", 1)[0]
+            if _INTENT_RE.search(heading):
+                category = "intent"
+            elif _REFERENCE_RE.search(heading):
+                category = "reference"
+            else:
+                category = "requirement"
+            sections.append((part, category))
+        else:
+            preamble = part
+
+    if not sections:
+        return markdown_body
+
+    ordered = (
+        [s for s in sections if s[1] == "intent"]
+        + [s for s in sections if s[1] == "requirement"]
+        + [s for s in sections if s[1] == "reference"]
+    )
+
+    result_parts = []
+    if preamble:
+        result_parts.append(preamble)
+    for text, _ in ordered:
+        result_parts.append(text)
+    return "\n\n".join(result_parts)
 
 
 def load_playbooks_for_display(
@@ -119,18 +179,13 @@ def load_playbooks_for_display(
     entries = load_playbooks_from_markdown(directory)
     for e in entries:
         lines = e["markdown_body"].split("\n")
-        summary_lines = [l for l in lines if l.startswith("## Rule Summary")]
-        if summary_lines:
-            idx = lines.index(summary_lines[0])
-            summary = []
-            for l in lines[idx + 1:]:
-                if l.startswith("#"):
-                    break
-                if l.strip():
-                    summary.append(l.strip())
-            e["summary"] = " ".join(summary)[:300]
-        else:
-            e["summary"] = e["title"]
+        summary = ""
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
+                summary = stripped
+                break
+        e["summary"] = summary[:300] if summary else e["title"]
     return entries
 
 

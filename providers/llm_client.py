@@ -20,6 +20,7 @@ logger = logging.getLogger("llm_client")
 
 QUALITY_ROUTING = {
     "analysis":    "o3",
+    "revision":    "gpt-4o",
     "execution":   "o3",
     "parsing":     "gpt-4o-mini",
     "summary":     "gpt-4o",
@@ -28,6 +29,7 @@ QUALITY_ROUTING = {
 
 COST_ROUTING = {
     "analysis":    "gpt-4o",
+    "revision":    "gpt-4o",
     "execution":   "gpt-4o",
     "parsing":     "gpt-4o-mini",
     "summary":     "gpt-4o-mini",
@@ -79,6 +81,7 @@ def _apply_env_model_overrides(routing: Dict[str, str]) -> Dict[str, str]:
 
     env_map = {
         "analysis": "MODEL_ANALYSIS",
+        "revision": "MODEL_REVISION",
         "execution": "MODEL_EXECUTION",
         "parsing": "MODEL_PARSING",
         "summary": "MODEL_SUMMARY",

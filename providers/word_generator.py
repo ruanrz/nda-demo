@@ -7,7 +7,9 @@ Produces a .docx using Word revision elements:
   - Added text   → <w:ins> (real insertion revision)
   - Unchanged    → normal runs
 
-Uses diff_match_patch for character-level diffing.
+Uses diff_match_patch for word-level diffing: each unique word/whitespace
+token is mapped to a single Unicode character so that diff_match_patch
+operates on whole words rather than individual characters.
 When rationale cannot be encoded in revision metadata, attach one concise
 comment per changed paragraph/revision anchor.
 """
@@ -43,12 +45,15 @@ _PARA_PUNCT_MAP = str.maketrans({
     "\u00a0": " ",
 })
 
+_WORD_TOKEN_RE = re.compile(r"\S+|\s+")
+
 
 def generate_redline_docx(
     original_text: str,
     modified_text: str,
     issues_list: Optional[List[Dict[str, Any]]] = None,
     modifications: Optional[List[Dict[str, Any]]] = None,
+    revisions: Optional[List[Dict[str, Any]]] = None,
     title: Optional[str] = None,
     redline_heading: Optional[str] = None,
     include_issues_list: bool = False,
@@ -96,11 +101,11 @@ def generate_redline_docx(
             doc.add_heading(redline_heading, level=2)
 
         # ── Redline body (plain mode) ───────────────────────────
-        _add_redline_paragraphs(doc, original_text, modified_text, modifications or [])
+        _add_redline_paragraphs(doc, original_text, modified_text, modifications or [], revisions=revisions)
     else:
         # ── Redline body (template mode; keeps paragraph properties) ──
         _add_redline_paragraphs_from_template(
-            doc, original_text, modified_text, modifications or []
+            doc, original_text, modified_text, modifications or [], revisions=revisions
         )
 
     # ── Issues List table ────────────────────────────────────────
@@ -120,13 +125,45 @@ def generate_redline_docx(
     return buf
 
 
-def _compute_diffs(text1: str, text2: str):
-    """Character-level diff using diff_match_patch."""
+def compute_word_diffs(text1: str, text2: str):
+    """Word-level diff using diff_match_patch.
+
+    Tokenizes both texts into words and whitespace runs, maps each unique
+    token to a single Unicode character, diffs the encoded strings, then
+    decodes back.  The result has the same (op, text) format as
+    ``dmp.diff_main`` but every chunk is aligned to word boundaries.
+    """
     dmp = dmp_module.diff_match_patch()
-    dmp.Diff_Timeout = 2.0
-    diffs = dmp.diff_main(text1, text2)
+    dmp.Diff_Timeout = 120
+
+    tokens1 = _WORD_TOKEN_RE.findall(text1) if text1 else []
+    tokens2 = _WORD_TOKEN_RE.findall(text2) if text2 else []
+    if not tokens1 and not tokens2:
+        return []
+
+    token_array: List[str] = [""]
+    token_map: Dict[str, str] = {}
+
+    def _encode(tokens: List[str]) -> str:
+        chars: List[str] = []
+        for tok in tokens:
+            if tok not in token_map:
+                token_array.append(tok)
+                token_map[tok] = chr(len(token_array) - 1)
+            chars.append(token_map[tok])
+        return "".join(chars)
+
+    enc1 = _encode(tokens1)
+    enc2 = _encode(tokens2)
+
+    diffs = dmp.diff_main(enc1, enc2)
     dmp.diff_cleanupSemantic(diffs)
-    return diffs
+
+    result = []
+    for op, data in diffs:
+        decoded = "".join(token_array[ord(c)] for c in data)
+        result.append((op, decoded))
+    return result
 
 
 def _iso_now_utc() -> str:
@@ -136,7 +173,8 @@ def _iso_now_utc() -> str:
 
 def _ensure_review_settings(doc: Document) -> None:
     """
-    Force review metadata/settings so Word shows tracked revisions by default.
+    Force review metadata/settings so Word shows tracked revisions and
+    comment balloons by default when the document is opened.
     """
     settings = doc.settings.element
 
@@ -148,14 +186,22 @@ def _ensure_review_settings(doc: Document) -> None:
         revision_view = OxmlElement("w:revisionView")
         settings.append(revision_view)
 
-    # Ask Word to show markup/comments/ins-del on open.
     revision_view.set(qn("w:markup"), "1")
     revision_view.set(qn("w:comments"), "1")
     revision_view.set(qn("w:insDel"), "1")
     revision_view.set(qn("w:formatting"), "1")
     revision_view.set(qn("w:inkAnnotations"), "1")
 
-    # Remove view flags that can suppress revision rendering.
+    # Show comments and formatting changes in balloons (margin bubbles).
+    # <w:showComments/> and <w:showInsDel/> are Word 2010+ elements that
+    # control whether balloons appear in the margin for comments/revisions.
+    for tag in ("w:showComments", "w:showInsDel"):
+        existing = settings.find(qn(tag))
+        if existing is None:
+            elm = OxmlElement(tag)
+            elm.set(qn("w:val"), "1")
+            settings.append(elm)
+
     for tag in (
         "w:doNotShowInsDel",
         "w:doNotShowMarkup",
@@ -227,32 +273,86 @@ def _find_mod_reason(
     modified_para: str,
     changed_text: str,
     modifications: List[Dict[str, Any]],
+    revisions: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Pick the most relevant playbook rationale for a changed paragraph."""
+    """Pick the most relevant playbook rationale for a changed paragraph.
+
+    Prioritizes revision-level reasoning (from v2 pipeline) which contains
+    rich AI-generated explanations, falling back to modification-level
+    explanations (legacy).
+    """
+    if revisions:
+        reason = _find_revision_reason(original_para, modified_para, revisions)
+        if reason:
+            return reason
+
     changed_norm = changed_text.strip()
     best_reason = ""
 
     for mod in modifications:
-        orig_fragment = str(mod.get("original_fragment", "") or "")
-        mod_fragment = str(mod.get("modified_fragment", "") or "")
-        explanation = str(mod.get("explanation", "") or "").strip()
+        orig_fragment = str(
+            mod.get("original_fragment")
+            or mod.get("original_text")
+            or mod.get("source_fragment")
+            or mod.get("from")
+            or ""
+        )
+        mod_fragment = str(
+            mod.get("modified_fragment")
+            or mod.get("modified_text")
+            or mod.get("replacement")
+            or mod.get("replace_with")
+            or mod.get("to")
+            or ""
+        )
+        explanation = str(
+            mod.get("explanation")
+            or mod.get("reason")
+            or mod.get("rationale")
+            or mod.get("ai_reason")
+            or mod.get("modification_reason")
+            or ""
+        ).strip()
         rule_title = str(mod.get("rule_title", "") or "").strip()
         rule_id = str(mod.get("rule_id", "") or "").strip()
+        mod_type = str(mod.get("modification_type", "") or "").strip()
 
-        if not explanation:
-            continue
+        parts: List[str] = []
+        if rule_id:
+            parts.append(f"[{rule_id}]")
+        if rule_title:
+            parts.append(rule_title)
 
-        reason_prefix = rule_title or rule_id or "Playbook rule"
-        reason = _short_reason(f"{reason_prefix}: {explanation}")
+        if explanation:
+            reason_lines = [
+                "AI审阅修改说明",
+                f"规则依据: {' '.join(parts).strip()}".strip(),
+                f"AI判断: {explanation}",
+            ]
+        else:
+            reason_lines = [
+                "AI审阅修改说明",
+                f"规则依据: {' '.join(parts).strip() or '已选 Playbook 规则'}",
+                "AI判断: 该处表述与已选规则不一致，需要进行定向修订。",
+            ]
 
-        # Strong match: changed token appears in known before/after fragments.
+        if orig_fragment or mod_fragment:
+            reason_lines.append(
+                f"修改内容: \"{_short_reason(orig_fragment, max_len=160) or '(原文片段)'}\" -> "
+                f"\"{_short_reason(mod_fragment, max_len=160) or '(新文本片段)'}\""
+            )
+
+        if mod_type:
+            reason_lines.append(f"修改类型: {mod_type}")
+
+        reason = _short_reason("\n".join(reason_lines), max_len=1200)
+
         if changed_norm and (
             (orig_fragment and changed_norm in orig_fragment)
             or (mod_fragment and changed_norm in mod_fragment)
         ):
             return reason
 
-        # Paragraph-level fallback.
         if (
             (orig_fragment and orig_fragment in original_para)
             or (mod_fragment and mod_fragment in modified_para)
@@ -263,17 +363,110 @@ def _find_mod_reason(
     return best_reason
 
 
+def _find_revision_reason(
+    original_para: str,
+    modified_para: str,
+    revisions: List[Dict[str, Any]],
+) -> str:
+    """Find the reasoning from a revision that matches this paragraph.
+
+    Produces a structured comment with rule IDs, reasoning, and individual
+    change descriptions so reviewers can understand *why* each edit was made.
+    """
+    norm_para = _normalize_paragraph_for_alignment(original_para)
+
+    for rev in revisions:
+        orig_clause = rev.get("original_clause", "")
+        if not orig_clause:
+            continue
+
+        norm_clause = _normalize_paragraph_for_alignment(orig_clause)
+        if not norm_clause or not norm_para:
+            continue
+
+        if norm_clause in norm_para or norm_para in norm_clause:
+            return _build_revision_comment(rev)
+
+    return ""
+
+
+def _build_revision_comment(rev: Dict[str, Any]) -> str:
+    """Build a structured comment string from a revision dict."""
+    parts: List[str] = ["AI审阅修改说明"]
+
+    rule_ids = rev.get("applicable_rule_ids", [])
+    if rule_ids:
+        label = ", ".join(rule_ids) if isinstance(rule_ids, list) else str(rule_ids)
+        parts.append(f"规则依据: {label}")
+
+    reasoning = (rev.get("reasoning") or "").strip()
+    if reasoning:
+        parts.append(f"AI判断: {reasoning}")
+
+    changes = rev.get("changes_made", [])
+    if changes:
+        parts.append("修改明细:")
+        for ch in changes:
+            what = (ch.get("what") or "").strip()
+            why = (ch.get("why") or "").strip()
+            rule_id = (ch.get("rule_id") or "").strip()
+            if what and why:
+                line = f"• 修改: {what}；原因: {why}"
+                if rule_id:
+                    line += f"（{rule_id}）"
+                parts.append(line)
+            elif what:
+                parts.append(f"• 修改: {what}")
+
+    if len(parts) == 1:
+        parts.append("规则依据: 已选 Playbook 规则")
+        parts.append("AI判断: 该处条款与规则要求不一致，已按规则进行最小必要修改。")
+
+    return _short_reason("\n".join(parts), max_len=1200)
+
+
 def _try_add_comment(doc: Document, anchor_run: Run, reason: str) -> None:
-    """Best-effort add_comment, without breaking document generation."""
+    """Best-effort add_comment with multi-paragraph support.
+
+    If *reason* contains newlines, each line becomes a separate paragraph
+    inside the comment so that rule IDs, reasoning, and change bullets are
+    visually distinct in the Word comment pane.
+    """
     if not reason:
         return
     try:
+        # Write full rationale in one call. This is more reliable across
+        # python-docx versions than trying to append paragraphs later.
         doc.add_comment(
             anchor_run,
             text=reason,
             author="AI Legal Assistant",
             initials="AI",
         )
+    except Exception:
+        try:
+            doc.add_comment(
+                anchor_run,
+                text=_short_reason(reason, max_len=300),
+                author="AI Legal Assistant",
+                initials="AI",
+            )
+        except Exception:
+            pass
+
+
+def _append_comment_paragraph(comment_element, text: str) -> None:
+    """Append an additional <w:p> to an existing comment element."""
+    try:
+        p = OxmlElement("w:p")
+        r = OxmlElement("w:r")
+        t = OxmlElement("w:t")
+        if _needs_space_preserve(text):
+            t.set(qn("xml:space"), "preserve")
+        t.text = text
+        r.append(t)
+        p.append(r)
+        comment_element.append(p)
     except Exception:
         pass
 
@@ -283,6 +476,7 @@ def _add_redline_paragraphs(
     original: str,
     modified: str,
     modifications: List[Dict[str, Any]],
+    revisions: Optional[List[Dict[str, Any]]] = None,
 ):
     """
     Split both texts into paragraphs, diff each pair, and write
@@ -291,10 +485,8 @@ def _add_redline_paragraphs(
     orig_paras = original.split("\n")
     mod_paras = modified.split("\n")
 
-    # Use the longer list length
     max_len = max(len(orig_paras), len(mod_paras))
 
-    # Pad shorter list
     while len(orig_paras) < max_len:
         orig_paras.append("")
     while len(mod_paras) < max_len:
@@ -315,6 +507,7 @@ def _add_redline_paragraphs(
             author=author,
             revision_id=revision_id,
             date_iso=date_iso,
+            revisions=revisions,
         )
 
 
@@ -341,12 +534,12 @@ def _render_paragraph_diff(
     author: str,
     revision_id: int,
     date_iso: str,
+    revisions: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
     """
     Render a paragraph diff into an existing paragraph and return next revision id.
 
-    Important behavior:
-    - If normalized text is effectively equal, keep paragraph clean (no synthetic redline).
+    - If normalized text is effectively equal, keep paragraph clean.
     - Only changed paragraphs get rewritten with ins/del revisions.
     """
     _clear_paragraph_content(para)
@@ -360,7 +553,7 @@ def _render_paragraph_diff(
             run.font.color.rgb = _BLACK
         return revision_id
 
-    diffs = _compute_diffs(orig_p, mod_p)
+    diffs = compute_word_diffs(orig_p, mod_p)
     comment_anchor: Optional[Run] = None
     comment_reason = ""
     for op, text in diffs:
@@ -383,7 +576,7 @@ def _render_paragraph_diff(
             if comment_anchor is None and deleted_run is not None:
                 comment_anchor = deleted_run
             if not comment_reason:
-                comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications)
+                comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications, revisions=revisions)
         elif op == dmp_module.diff_match_patch.DIFF_INSERT:
             inserted_run = _append_tracked_insert(
                 para=para,
@@ -396,12 +589,12 @@ def _render_paragraph_diff(
             if comment_anchor is None and inserted_run is not None:
                 comment_anchor = inserted_run
             if not comment_reason:
-                comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications)
+                comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications, revisions=revisions)
 
     if not comment_reason:
-        comment_reason = "Aligned this edit with the selected playbook requirement."
+        comment_reason = "Playbook-driven edit: aligned clause with selected review rules."
     if comment_anchor is not None:
-        _try_add_comment(doc, comment_anchor, _short_reason(comment_reason))
+        _try_add_comment(doc, comment_anchor, comment_reason)
     return revision_id
 
 
@@ -421,6 +614,7 @@ def _add_redline_paragraphs_from_template(
     original: str,
     modified: str,
     modifications: List[Dict[str, Any]],
+    revisions: Optional[List[Dict[str, Any]]] = None,
 ):
     """
     Rewrite the source document's existing paragraphs so paragraph-level formatting
@@ -476,6 +670,7 @@ def _add_redline_paragraphs_from_template(
                     author=author,
                     revision_id=revision_id,
                     date_iso=date_iso,
+                    revisions=revisions,
                 )
 
             for orig_idx in range(i1 + pair_count, i2):
@@ -489,6 +684,7 @@ def _add_redline_paragraphs_from_template(
                     author=author,
                     revision_id=revision_id,
                     date_iso=date_iso,
+                    revisions=revisions,
                 )
 
             if j1 + pair_count < j2:
@@ -510,6 +706,7 @@ def _add_redline_paragraphs_from_template(
                         author=author,
                         revision_id=revision_id,
                         date_iso=date_iso,
+                        revisions=revisions,
                     )
             continue
 
@@ -525,6 +722,7 @@ def _add_redline_paragraphs_from_template(
                     author=author,
                     revision_id=revision_id,
                     date_iso=date_iso,
+                    revisions=revisions,
                 )
             continue
 
@@ -542,14 +740,21 @@ def _add_redline_paragraphs_from_template(
                     author=author,
                     revision_id=revision_id,
                     date_iso=date_iso,
+                    revisions=revisions,
                 )
 
 
-def _short_reason(reason: str, max_len: int = 160) -> str:
-    """Keep rationale short and readable for Word comments."""
+def _short_reason(reason: str, max_len: int = 500) -> str:
+    """Keep rationale readable for Word comments while preserving enough detail.
+
+    Preserves intentional newlines (used for multi-paragraph comments) while
+    collapsing redundant whitespace within each line.
+    """
     if not reason:
         return ""
-    compact = " ".join(reason.split())
+    lines = reason.split("\n")
+    compact_lines = [" ".join(line.split()) for line in lines]
+    compact = "\n".join(line for line in compact_lines if line)
     if len(compact) <= max_len:
         return compact
     return compact[: max_len - 3].rstrip() + "..."

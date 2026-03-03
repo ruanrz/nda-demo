@@ -1,27 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Unified contract review pipeline.
+Unified contract review pipeline (v2).
 
-Replaces the old 6-call approach (search+apply × 3 rule types) with a
-streamlined pipeline:
+New architecture — replaces the old find/replace approach:
 
-  Step 1  analysis   → analyse contract against ALL rules  (LLM)
-  Step 2  execution  → apply planned modifications         (local first, LLM fallback)
-  Step 3  summary    → generate Issues List                (LLM, optional)
-
-Model selection depends on the active preset (quality / cost).
-See llm_client.py for routing details.
+  Step 1  analysis   → diagnose contract against ALL rules     (1 LLM call)
+  Step 2  revision   → per-clause AI rewrite                   (N LLM calls, parallel)
+  Step 3  assembly   → stitch revised clauses into full text   (local)
+  Step 4  summary    → generate Issues List                    (1 LLM call, optional)
 """
 
 import json
 import logging
-import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .llm_client import LLMClient, get_llm_client
-from .contract_parser import parse_contract_structure, format_structured_contract
+from .contract_parser import parse_contract_structure
 from .playbook_loader import (
     load_playbooks_from_markdown,
     format_markdown_playbooks_for_prompt,
@@ -29,8 +26,8 @@ from .playbook_loader import (
 from .unified_prompts import (
     ANALYSIS_SYSTEM_PROMPT,
     ANALYSIS_USER_PROMPT,
-    EXECUTION_SYSTEM_PROMPT,
-    EXECUTION_USER_PROMPT,
+    REVISION_SYSTEM_PROMPT,
+    REVISION_USER_PROMPT,
     ISSUES_LIST_SYSTEM_PROMPT,
     ISSUES_LIST_USER_PROMPT,
     OWN_PAPER_MODE,
@@ -38,6 +35,7 @@ from .unified_prompts import (
     ISSUES_OWN_PAPER_CONTEXT,
     ISSUES_COUNTERPARTY_CONTEXT,
     format_rules_for_prompt,
+    get_rules_text_by_ids,
 )
 
 logger = logging.getLogger("unified_review")
@@ -55,30 +53,17 @@ def unified_review_contract(
     playbook_source: str = "markdown",
 ) -> Dict[str, Any]:
     """
-    Run the full review pipeline.
+    Run the full review pipeline (v2).
 
-    Args:
-        contract_text:    Raw contract text (plain text or parsed .docx content).
-        playbook_entries: Playbook entries (JSON dicts). If None, loads from Markdown files.
-        mode:             "own_paper" or "counterparty".
-        client:           LLMClient instance (auto-created if None).
-        generate_issues:  Whether to make the 3rd call for Issues List.
-        progress_callback: Optional callable(stage: str, detail: str) for UI updates.
-        playbook_source:  "markdown" (default) or "json". Controls how rules are
-                          formatted for the prompt.
+    Architecture:
+      Step 1: Analysis  — diagnose which clauses need revision (1 LLM call)
+      Step 2: Revision  — per-clause AI rewrite (N parallel LLM calls)
+      Step 3: Assembly  — replace original clauses with revised versions
+      Step 4: Issues    — generate structured issues list (optional)
 
-    Returns:
-        {
-            "analysis":       [...],       # per-rule analysis
-            "modifications":  [...],       # per-modification detail
-            "final_text":     "...",       # complete modified contract
-            "issues_list":    [...],       # structured issues (if generate_issues)
-            "executive_summary": "...",
-            "compliance_score": {...},
-            "summary":        {...},       # stats
-            "llm_stats":      {...},       # call timing / token usage
-            "contract_structure": [...],   # parsed clause structure
-        }
+    Returns dict with: analysis, defined_terms, revisions, final_text,
+    issues_list, executive_summary, compliance_score, summary, llm_stats,
+    step_trace.
     """
     if client is None:
         client = get_llm_client()
@@ -86,6 +71,8 @@ def unified_review_contract(
 
     result: Dict[str, Any] = {
         "analysis": [],
+        "defined_terms": {},
+        "revisions": [],
         "modifications": [],
         "final_text": contract_text,
         "issues_list": [],
@@ -106,38 +93,29 @@ def unified_review_contract(
     clauses = parse_contract_structure(contract_text)
     result["contract_structure"] = [c.to_dict() for c in clauses]
     result["step_trace"].append({
-        "step": "Step 0",
-        "name": "Parsing",
+        "step": "Step 0", "name": "Parsing",
         "engine": "Local parser",
-        "thinking": [
-            f"Detected {len(clauses)} structural clauses/sections from contract text.",
-            "Prepared structured clause map as context for downstream analysis.",
-        ],
+        "thinking": [f"Detected {len(clauses)} structural clauses/sections."],
         "output": {"clauses_detected": len(clauses)},
     })
-    logger.info(f"Parsed {len(clauses)} clauses from contract")
 
     # ── Load playbooks if not provided ───────────────────────────
     if playbook_entries is None:
         playbook_entries = load_playbooks_from_markdown()
         playbook_source = "markdown"
 
-    # ── Prepare rule text for prompt ─────────────────────────────
-    if playbook_source == "markdown" and playbook_entries and "markdown_body" in playbook_entries[0]:
-        rules_text = format_markdown_playbooks_for_prompt(playbook_entries)
-    else:
-        rules_text = format_rules_for_prompt(playbook_entries)
+    rules_text = format_rules_for_prompt(playbook_entries)
     mode_instruction = COUNTERPARTY_MODE if mode == "counterparty" else OWN_PAPER_MODE
 
-    # ── Step 1: Analysis (model depends on preset) ─────────────
+    # ── Step 1: Analysis — diagnose gaps (1 LLM call) ───────────
     _progress("analysis", "Analysing contract against all Playbook rules…")
-    logger.info(f"Step 1: Analysis call (preset={client.preset_name})")
+    logger.info("Step 1: Analysis call (preset=%s)", client.preset_name)
 
     analysis_result = client.call_json(
         task_type="analysis",
         system_prompt=ANALYSIS_SYSTEM_PROMPT,
         user_prompt=ANALYSIS_USER_PROMPT.format(
-            playbook_rules_json=rules_text,
+            playbook_rules=rules_text,
             contract_text=contract_text,
             mode_instruction=mode_instruction,
         ),
@@ -145,177 +123,116 @@ def unified_review_contract(
         max_tokens=16384,
     )
 
-    analysis_items = analysis_result.get("analysis", [])
+    defined_terms = analysis_result.get("defined_terms", {})
+    clause_analysis = analysis_result.get("clause_analysis", [])
     analysis_summary = analysis_result.get("summary", {})
-    result["analysis"] = analysis_items
+
+    result["analysis"] = clause_analysis
+    result["defined_terms"] = defined_terms
     result["summary"] = analysis_summary
 
-    modifications_planned = [
-        item for item in analysis_items if item.get("modification_needed")
+    clauses_needing_revision = [
+        c for c in clause_analysis
+        if c.get("compliance_status") != "compliant"
+        and c.get("severity") != "GREEN"
     ]
+
+    # Group by clause_text to avoid revising the same clause multiple times
+    clause_groups = _group_analyses_by_clause(clauses_needing_revision)
+
     logger.info(
-        f"Analysis complete: {len(analysis_items)} rules checked, "
-        f"{len(modifications_planned)} modifications planned"
+        "Analysis: %d rules checked, %d unique clauses need revision",
+        len(clause_analysis), len(clause_groups),
     )
-    representative_findings = []
-    for item in analysis_items:
-        if item.get("modification_needed"):
-            rule_title = item.get("rule_title", item.get("rule_id", "Rule"))
+
+    analysis_thinking = []
+    for item in clause_analysis:
+        if item.get("compliance_status") != "compliant":
             sev = item.get("severity", "YELLOW")
-            rationale = item.get("rationale", "")
-            if rationale:
-                representative_findings.append(f"[{sev}] {rule_title}: {rationale}")
-            else:
-                representative_findings.append(f"[{sev}] {rule_title}: modification planned.")
-        if len(representative_findings) >= 6:
-            break
-    if not representative_findings:
-        representative_findings = ["All checked rules are compliant; no redline needed."]
+            cid = item.get("clause_id", "?")
+            gaps = item.get("gaps", "")
+            analysis_thinking.append(f"[{sev}] {cid}: {gaps[:120]}")
+    if not analysis_thinking:
+        analysis_thinking = ["All checked rules are compliant; no revision needed."]
+
     result["step_trace"].append({
-        "step": "Step 1",
-        "name": "Analysis",
+        "step": "Step 1", "name": "Analysis",
         "engine": f"LLM ({client.routing.get('analysis', 'default')})",
-        "thinking": representative_findings,
+        "thinking": analysis_thinking[:8],
         "output": {
-            "rules_checked": analysis_summary.get("total_rules_checked", len(analysis_items)),
-            "modifications_planned": len(modifications_planned),
+            "rules_checked": analysis_summary.get("total_rules_checked", len(clause_analysis)),
+            "clauses_to_revise": len(clause_groups),
             "overall_risk": analysis_summary.get("overall_risk", "unknown"),
         },
     })
     _progress(
         "analysis_done",
-        f"Found {len(modifications_planned)} issues in "
-        f"{analysis_summary.get('total_rules_checked', len(analysis_items))} rules"
+        f"Found {len(clause_groups)} clauses to revise across "
+        f"{analysis_summary.get('total_rules_checked', len(clause_analysis))} rules"
     )
 
-    # ── Step 2: Execution (local find/replace first, LLM fallback) ──
-    if modifications_planned:
-        _progress("execution", f"Applying {len(modifications_planned)} modifications…")
-        logger.info(f"Step 2: Executing {len(modifications_planned)} modifications")
+    # ── Step 2: Per-clause revision (N parallel LLM calls) ───────
+    if clause_groups:
+        _progress("execution", f"Revising {len(clause_groups)} clauses…")
+        logger.info("Step 2: Revising %d clauses (parallel)", len(clause_groups))
 
-        mods_for_prompt = []
-        for item in modifications_planned:
-            plan = item.get("modification_plan", {})
-            mods_for_prompt.append({
-                "rule_id": item.get("rule_id", ""),
-                "rule_title": item.get("rule_title", ""),
-                "source_playbook": item.get("source_playbook", ""),
-                "find_text": plan.get("find_text", ""),
-                "replace_with": plan.get("replace_with", ""),
-                "type": plan.get("type", "replace"),
-                "description": plan.get("insertion_point_description", ""),
-            })
-
-        local_text, applied, failed = _local_find_replace(contract_text, mods_for_prompt)
-        logger.info(f"Local find/replace: {len(applied)} applied, {len(failed)} failed")
-
-        if not failed:
-            result["modifications"] = applied
-            result["final_text"] = local_text
-            result["step_trace"].append({
-                "step": "Step 2",
-                "name": "Execution",
-                "engine": "Local deterministic find/replace",
-                "thinking": [
-                    f"Applied {len(applied)} planned edits via exact string matching.",
-                    "All planned edits matched locally; no LLM execution fallback needed.",
-                ],
-                "output": {
-                    "applied": len(applied),
-                    "failed": 0,
-                    "fallback_used": False,
-                },
-            })
-            _progress("execution_done", f"Applied {len(applied)} modifications (local)")
-        else:
-            logger.info(f"Falling back to LLM for {len(failed)} unresolved modifications")
-            _progress("execution", f"LLM fallback for {len(failed)} modifications…")
-            exec_result = client.call_json(
-                task_type="execution",
-                system_prompt=EXECUTION_SYSTEM_PROMPT,
-                user_prompt=EXECUTION_USER_PROMPT.format(
-                    modifications_json=json.dumps(failed, ensure_ascii=False, indent=2),
-                    original_text=local_text,
-                ),
-                temperature=0.0,
-                max_tokens=16384,
-            )
-
-            llm_mods = exec_result.get("modifications_applied", [])
-            result["modifications"] = applied + llm_mods
-            result["final_text"] = exec_result.get("final_text", local_text)
-
-            verification = exec_result.get("verification", {})
-            exec_thinking = [
-                f"Local find/replace succeeded for {len(applied)} modifications.",
-                f"LLM fallback handled remaining {len(failed)} modifications.",
-            ]
-            for mod in result["modifications"][:6]:
-                why = mod.get("explanation", "")
-                title = mod.get("rule_title", mod.get("rule_id", "Rule"))
-                if why:
-                    exec_thinking.append(f"{title}: {why}")
-                else:
-                    exec_thinking.append(f"{title}: change applied.")
-            result["step_trace"].append({
-                "step": "Step 2",
-                "name": "Execution",
-                "engine": f"Local + LLM fallback ({client.routing.get('execution', 'default')})",
-                "thinking": exec_thinking,
-                "output": {
-                    "planned": len(mods_for_prompt),
-                    "applied_local": len(applied),
-                    "applied_llm": len(llm_mods),
-                    "applied_total": len(result["modifications"]),
-                    "fallback_used": True,
-                },
-            })
-            logger.info(
-                f"LLM execution complete: "
-                f"{verification.get('total_applied', 0)}/{verification.get('total_planned', 0)} applied"
-            )
-            _progress("execution_done", f"Applied {len(result['modifications'])} modifications (LLM fallback)")
-    else:
-        _progress("execution_done", "No modifications needed — contract is compliant")
-        result["modifications"] = []
-        result["step_trace"].append({
-            "step": "Step 2",
-            "name": "Execution",
-            "engine": "Skipped",
-            "thinking": ["No non-compliant findings from analysis; no edits executed."],
-            "output": {"applied": 0, "fallback_used": False},
-        })
-
-    # ── Step 2.5: Deterministic safeguard for Rule 1 ─────────────
-    # Ensure trade secret references are always legally qualified, even if
-    # analysis/execution missed this simple add_text rule.
-    safeguarded_text, safeguard_mods = _enforce_trade_secret_qualifier(
-        result.get("final_text", "")
-    )
-    if safeguard_mods:
-        result["final_text"] = safeguarded_text
-        result["modifications"].extend(safeguard_mods)
-        result["step_trace"].append({
-            "step": "Step 2.5",
-            "name": "Deterministic Safeguard",
-            "engine": "Local regex guardrail",
-            "thinking": [
-                "Detected unqualified trade secret references in final text.",
-                "Applied deterministic qualifier insertion for Rule 1 to prevent silent misses.",
-            ],
-            "output": {
-                "rule_id": "rule_1",
-                "applied": len(safeguard_mods),
-            },
-        })
-        logger.info(
-            "Safeguard applied Rule 1 qualifier %s time(s)", len(safeguard_mods)
+        defined_terms_str = json.dumps(defined_terms, ensure_ascii=False, indent=2)
+        revisions = _revise_clauses_parallel(
+            clause_groups=clause_groups,
+            playbook_entries=playbook_entries,
+            defined_terms_str=defined_terms_str,
+            client=client,
+            progress_callback=_progress,
         )
 
-    # ── Step 3: Issues List (optional) ──────────────────────────
+        result["revisions"] = revisions
+
+        # Build modifications list for backward compatibility
+        for rev in revisions:
+            for ch in rev.get("changes_made", []):
+                result["modifications"].append({
+                    "rule_id": ch.get("rule_id", ""),
+                    "rule_title": ch.get("what", ""),
+                    "original_fragment": rev.get("original_clause", "")[:200],
+                    "modified_fragment": rev.get("revised_clause", "")[:200],
+                    "modification_type": "revision",
+                    "explanation": ch.get("why", ""),
+                    "severity": "P1",
+                })
+
+        rev_thinking = []
+        for rev in revisions:
+            reasoning = rev.get("reasoning", "")
+            cid = rev.get("clause_id", "?")
+            rev_thinking.append(f"{cid}: {reasoning[:150]}")
+
+        result["step_trace"].append({
+            "step": "Step 2", "name": "Revision",
+            "engine": f"LLM ({client.routing.get('revision', 'default')}) × {len(clause_groups)}",
+            "thinking": rev_thinking[:8],
+            "output": {
+                "clauses_revised": len(revisions),
+                "total_changes": sum(len(r.get("changes_made", [])) for r in revisions),
+            },
+        })
+        _progress("execution_done", f"Revised {len(revisions)} clauses")
+    else:
+        _progress("execution_done", "No revisions needed — contract is compliant")
+        result["step_trace"].append({
+            "step": "Step 2", "name": "Revision",
+            "engine": "Skipped",
+            "thinking": ["No non-compliant findings; no revisions needed."],
+            "output": {"clauses_revised": 0},
+        })
+
+    # ── Step 3: Assembly — stitch revised clauses back ───────────
+    final_text = _assemble_final_text(contract_text, result["revisions"])
+    result["final_text"] = final_text
+
+    # ── Step 4: Issues List (optional) ───────────────────────────
     if generate_issues:
         _progress("issues", "Generating Issues List & risk summary…")
-        logger.info("Step 3: Issues list generation")
+        logger.info("Step 4: Issues list generation")
 
         mode_ctx = (
             ISSUES_COUNTERPARTY_CONTEXT if mode == "counterparty"
@@ -327,7 +244,7 @@ def unified_review_contract(
             system_prompt=ISSUES_LIST_SYSTEM_PROMPT,
             user_prompt=ISSUES_LIST_USER_PROMPT.format(
                 analysis_json=json.dumps(result["analysis"], ensure_ascii=False, indent=2),
-                modifications_json=json.dumps(result["modifications"], ensure_ascii=False, indent=2),
+                revisions_json=json.dumps(result["revisions"], ensure_ascii=False, indent=2),
                 final_text=result["final_text"],
                 mode_context=mode_ctx,
             ),
@@ -338,22 +255,19 @@ def unified_review_contract(
         result["issues_list"] = issues_result.get("issues", [])
         result["executive_summary"] = issues_result.get("executive_summary", "")
         result["compliance_score"] = issues_result.get("compliance_score", {})
+
         issue_thinking = []
+        if result["executive_summary"]:
+            issue_thinking.append(f"Executive summary: {result['executive_summary']}")
         for iss in result["issues_list"][:6]:
             sev = iss.get("severity", "P2")
-            title = iss.get("title", iss.get("description", "Issue"))
-            action = iss.get("recommended_action", "")
-            if action:
-                issue_thinking.append(f"[{sev}] {title}: {action}")
-            else:
-                issue_thinking.append(f"[{sev}] {title}")
-        if result["executive_summary"]:
-            issue_thinking.insert(0, f"Executive summary: {result['executive_summary']}")
+            title = iss.get("title", "Issue")
+            issue_thinking.append(f"[{sev}] {title}")
         if not issue_thinking:
-            issue_thinking = ["No material issues identified by summary stage."]
+            issue_thinking = ["No material issues identified."]
+
         result["step_trace"].append({
-            "step": "Step 3",
-            "name": "Issues & Risk Summary",
+            "step": "Step 4", "name": "Issues & Risk Summary",
             "engine": f"LLM ({client.routing.get('summary', 'default')})",
             "thinking": issue_thinking,
             "output": {
@@ -372,10 +286,10 @@ def unified_review_contract(
 # ─── Helpers ─────────────────────────────────────────────────────
 
 _PUNCT_MAP = str.maketrans({
-    '\u201c': '"', '\u201d': '"',   # curly double quotes → straight
-    '\u2018': "'", '\u2019': "'",   # curly single quotes → straight
-    '\u2014': '-', '\u2013': '-',   # em-dash / en-dash → hyphen
-    '\u00a0': ' ',                  # non-breaking space → space
+    '\u201c': '"', '\u201d': '"',
+    '\u2018': "'", '\u2019': "'",
+    '\u2014': '-', '\u2013': '-',
+    '\u00a0': ' ',
 })
 
 
@@ -384,110 +298,192 @@ def _normalize_text(text: str) -> str:
     return re.sub(r'\s+', ' ', text.translate(_PUNCT_MAP)).strip()
 
 
-def _local_find_replace(
-    text: str,
-    modifications: List[Dict[str, Any]],
-) -> tuple:
+def _group_analyses_by_clause(
+    analyses: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     """
-    Attempt deterministic find/replace on the contract text.
+    Group analysis entries by clause_text so each unique clause is revised
+    only once, even if multiple rules apply to it.
 
-    Returns (modified_text, applied_list, failed_list).
-    - applied_list: modifications that succeeded locally.
-    - failed_list:  modifications where find_text was not found (need LLM fallback).
-
-    Matching strategy:
-      1. Exact substring match (preferred).
-      2. Normalized flexible match — normalizes whitespace and punctuation variants
-         (curly quotes, em-dashes, non-breaking spaces, etc.) then builds a regex
-         that tolerates variable whitespace between words.
+    Returns a list of dicts:
+      { clause_id, clause_text, clause_location, applicable_rule_ids, combined_gaps, severity }
     """
-    applied: List[Dict[str, Any]] = []
-    failed: List[Dict[str, Any]] = []
-    current = text
+    groups: Dict[str, Dict[str, Any]] = {}
 
-    for mod in modifications:
-        find = mod.get("find_text", "")
-        replace = mod.get("replace_with", "")
-        if not find:
-            failed.append(mod)
+    for item in analyses:
+        clause_text = item.get("clause_text", "").strip()
+        if not clause_text:
             continue
 
-        success_record = {
-            "rule_id": mod.get("rule_id", ""),
-            "rule_title": mod.get("rule_title", ""),
-            "original_fragment": find,
-            "modified_fragment": replace,
-            "modification_type": mod.get("type", "replace"),
-            "explanation": mod.get("description", "Applied via local find/replace"),
-            "severity": "P1",
+        norm_key = _normalize_text(clause_text)[:200]
+
+        if norm_key not in groups:
+            groups[norm_key] = {
+                "clause_id": item.get("clause_id", "unknown"),
+                "clause_text": clause_text,
+                "clause_location": item.get("clause_location", ""),
+                "applicable_rule_ids": [],
+                "combined_gaps": [],
+                "severity": item.get("severity", "YELLOW"),
+            }
+
+        rule_ids = item.get("applicable_rule_ids", [])
+        if isinstance(rule_ids, str):
+            rule_ids = [rule_ids]
+        for rid in rule_ids:
+            if rid not in groups[norm_key]["applicable_rule_ids"]:
+                groups[norm_key]["applicable_rule_ids"].append(rid)
+
+        gaps = item.get("gaps", "")
+        if gaps and gaps not in groups[norm_key]["combined_gaps"]:
+            groups[norm_key]["combined_gaps"].append(gaps)
+
+        if item.get("severity") == "RED":
+            groups[norm_key]["severity"] = "RED"
+
+    result = []
+    for g in groups.values():
+        g["combined_gaps"] = "\n".join(g["combined_gaps"])
+        result.append(g)
+    return result
+
+
+def _revise_clauses_parallel(
+    clause_groups: List[Dict[str, Any]],
+    playbook_entries: List[Dict[str, Any]],
+    defined_terms_str: str,
+    client: LLMClient,
+    progress_callback=None,
+) -> List[Dict[str, Any]]:
+    """
+    Revise each clause in parallel using ThreadPoolExecutor.
+    """
+    revisions: List[Dict[str, Any]] = []
+
+    def _revise_one(group: Dict[str, Any]) -> Dict[str, Any]:
+        applicable_rules_text = get_rules_text_by_ids(
+            group["applicable_rule_ids"], playbook_entries
+        )
+
+        rev_result = client.call_json(
+            task_type="revision",
+            system_prompt=REVISION_SYSTEM_PROMPT,
+            user_prompt=REVISION_USER_PROMPT.format(
+                original_clause=group["clause_text"],
+                applicable_rules=applicable_rules_text,
+                gap_assessment=group["combined_gaps"],
+                defined_terms=defined_terms_str,
+            ),
+            temperature=0.1,
+            max_tokens=8192,
+        )
+
+        return {
+            "clause_id": group["clause_id"],
+            "clause_location": group.get("clause_location", ""),
+            "original_clause": group["clause_text"],
+            "revised_clause": rev_result.get("revised_clause", ""),
+            "reasoning": rev_result.get("reasoning", ""),
+            "changes_made": rev_result.get("changes_made", []),
+            "severity": group["severity"],
+            "applicable_rule_ids": group["applicable_rule_ids"],
         }
 
-        if find in current:
-            current = current.replace(find, replace, 1)
-            applied.append(success_record)
+    max_workers = min(4, len(clause_groups))
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_revise_one, g): g
+            for g in clause_groups
+        }
+        for future in as_completed(futures):
+            group = futures[future]
+            try:
+                rev = future.result()
+                revisions.append(rev)
+                completed += 1
+                logger.info(
+                    "Revised clause '%s' (%d/%d)",
+                    group["clause_id"], completed, len(clause_groups),
+                )
+                if progress_callback:
+                    progress_callback(
+                        "execution",
+                        f"Revised {completed}/{len(clause_groups)} clauses…"
+                    )
+            except Exception as exc:
+                logger.error("Failed to revise clause '%s': %s", group["clause_id"], exc)
+                revisions.append({
+                    "clause_id": group["clause_id"],
+                    "original_clause": group["clause_text"],
+                    "revised_clause": group["clause_text"],
+                    "reasoning": f"Revision failed: {exc}",
+                    "changes_made": [],
+                    "severity": group["severity"],
+                    "applicable_rule_ids": group["applicable_rule_ids"],
+                    "error": str(exc),
+                })
+
+    return revisions
+
+
+def _assemble_final_text(
+    original_text: str,
+    revisions: List[Dict[str, Any]],
+) -> str:
+    """
+    Replace each original clause with its revised version in the full text.
+
+    Matching strategy:
+      1. Exact substring match.
+      2. Normalized match (whitespace/punctuation tolerance).
+    """
+    current = original_text
+
+    for rev in revisions:
+        original_clause = rev.get("original_clause", "")
+        revised_clause = rev.get("revised_clause", "")
+
+        if not original_clause or not revised_clause:
+            continue
+        if original_clause == revised_clause:
             continue
 
-        norm_find = _normalize_text(find)
-        if not norm_find:
-            failed.append(mod)
+        if original_clause in current:
+            current = current.replace(original_clause, revised_clause, 1)
             continue
 
-        escaped_words = [re.escape(w) for w in norm_find.split()]
+        # Normalized fallback
+        norm_original = _normalize_text(original_clause)
+        if not norm_original:
+            continue
+
+        escaped_words = [re.escape(w) for w in norm_original.split()]
         flex_pattern = r'\s+'.join(escaped_words)
         match = re.search(flex_pattern, current)
         if match:
-            current = current[:match.start()] + replace + current[match.end():]
-            success_record["original_fragment"] = match.group(0)
-            success_record["explanation"] += " (normalized match)"
-            applied.append(success_record)
+            current = current[:match.start()] + revised_clause + current[match.end():]
+            logger.info("Assembled clause '%s' via normalized match", rev.get("clause_id"))
             continue
 
+        # Punctuation-normalized fallback
         punct_current = current.translate(_PUNCT_MAP)
         match = re.search(flex_pattern, punct_current)
         if match:
-            success_record["original_fragment"] = current[match.start():match.end()]
-            current = current[:match.start()] + replace + current[match.end():]
-            success_record["explanation"] += " (punctuation-normalized match)"
-            applied.append(success_record)
+            current = current[:match.start()] + revised_clause + current[match.end():]
+            logger.info("Assembled clause '%s' via punctuation-normalized match", rev.get("clause_id"))
             continue
 
-        failed.append(mod)
+        logger.warning(
+            "Could not locate clause '%s' in contract for assembly",
+            rev.get("clause_id"),
+        )
 
-    return current, applied, failed
+    return current
 
 
-def _enforce_trade_secret_qualifier(text: str) -> tuple[str, List[Dict[str, Any]]]:
-    """
-    Deterministically enforce Rule 1:
-    add "(as defined by applicable law)" after unqualified "trade secret(s)".
-
-    This runs as a final guardrail so misses in the LLM planning/execution path
-    do not silently leave Rule 1 unapplied.
-    """
-    qualifier = " (as defined by applicable law)"
-    pattern = re.compile(
-        r"\b(trade secrets?)\b(?!\s*\(as defined by applicable law\))",
-        flags=re.IGNORECASE,
-    )
-    applied: List[Dict[str, Any]] = []
-
-    def _replace(match: re.Match) -> str:
-        original = match.group(0)
-        modified = f"{original}{qualifier}"
-        applied.append({
-            "rule_id": "rule_1",
-            "rule_title": "Qualify 'trade secret' legally",
-            "original_fragment": original,
-            "modified_fragment": modified,
-            "modification_type": "insert",
-            "explanation": "Applied deterministic Rule 1 safeguard",
-            "severity": "P1",
-        })
-        return modified
-
-    updated = pattern.sub(_replace, text or "")
-    return updated, applied
-
+# ── Legacy compatibility ─────────────────────────────────────────
 
 def load_playbook_entries(
     path: str,

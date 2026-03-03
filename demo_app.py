@@ -53,7 +53,7 @@ for p in (_providers_dir, _current_dir):
 # ── Import: NEW unified review pipeline ─────────────────────────
 try:
     from providers.unified_review import unified_review_contract
-    from providers.word_generator import generate_redline_docx, generate_clean_docx
+    from providers.word_generator import generate_redline_docx, generate_clean_docx, compute_word_diffs
     from providers.playbook_loader import (
         load_playbooks_from_markdown,
         load_playbooks_for_display,
@@ -130,10 +130,7 @@ st.markdown("""
 def generate_diff_html(text1: str, text2: str) -> str:
     if not text1 or not text2:
         return ""
-    dmp = dmp_module.diff_match_patch()
-    dmp.Diff_Timeout = 1.5
-    diffs = dmp.diff_main(text1, text2)
-    dmp.diff_cleanupSemantic(diffs)
+    diffs = compute_word_diffs(text1, text2)
     html = ""
     for op, data in diffs:
         escaped = data.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -149,10 +146,7 @@ def generate_diff_html(text1: str, text2: str) -> str:
 def diff_changed(text1: str, text2: str):
     if text1 == text2:
         return False, 0
-    dmp = dmp_module.diff_match_patch()
-    dmp.Diff_Timeout = 0.5
-    diffs = dmp.diff_main(text1, text2)
-    dmp.diff_cleanupSemantic(diffs)
+    diffs = compute_word_diffs(text1, text2)
     ops = [d for d in diffs if d[0] != dmp_module.diff_match_patch.DIFF_EQUAL]
     return len(ops) > 0, len(ops)
 
@@ -615,6 +609,7 @@ def render_contract_review_tab():
 
     # ── Display results ──────────────────────────────────────────
     final_text = result.get("final_text", contract_text)
+    revisions = result.get("revisions", [])
     modifications = result.get("modifications", [])
     analysis = result.get("analysis", [])
     issues = result.get("issues_list", [])
@@ -630,15 +625,16 @@ def render_contract_review_tab():
 
     if executive_summary:
         if mode == "counterparty":
-            st.warning(f"⚠️ **Counterparty Paper Assessment:** {executive_summary}")
+            st.warning(f"**Counterparty Paper Assessment:** {executive_summary}")
         else:
-            st.success(f"✅ **Assessment:** {executive_summary}")
+            st.success(f"**Assessment:** {executive_summary}")
 
+    total_changes = sum(len(r.get("changes_made", [])) for r in revisions)
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Rules Checked", summary.get("total_rules_checked", len(analysis)))
     c2.metric("Compliant", summary.get("compliant", 0))
     c3.metric("Non-Compliant", summary.get("non_compliant", 0))
-    c4.metric("Modifications", len(modifications))
+    c4.metric("Clauses Revised", len(revisions))
     c5.metric("Risk", summary.get("overall_risk", "—").upper())
 
     if compliance:
@@ -647,7 +643,7 @@ def render_contract_review_tab():
         st.caption(f"Compliance: {pct}%  ({compliance.get('compliant',0)} / {compliance.get('total_rules',0)} rules)")
 
     # ── Tabs for details ─────────────────────────────────────────
-    detail_tabs = st.tabs(["📝 Redline", "📊 Issues List", "🔍 Analysis Detail", "📈 LLM Stats", "🧠 Agent Thinking"])
+    detail_tabs = st.tabs(["Redline", "Issues List", "Analysis Detail", "LLM Stats", "Agent Thinking"])
 
     # ── Tab: Redline ─────────────────────────────────────────────
     with detail_tabs[0]:
@@ -655,7 +651,7 @@ def render_contract_review_tab():
         if not changed:
             st.success("Contract is fully compliant — no modifications needed.")
         else:
-            st.markdown(f"**{len(modifications)} modifications applied** ({ops_count} edit operations)")
+            st.markdown(f"**{len(revisions)} clauses revised** ({total_changes} individual changes, {ops_count} edit operations)")
 
             # Full redline diff
             diff_html = generate_diff_html(contract_text, final_text)
@@ -664,41 +660,49 @@ def render_contract_review_tab():
                 unsafe_allow_html=True,
             )
 
-            # Per-modification detail with AI reasoning
-            analysis_by_rule = {
-                item.get("rule_id", ""): item for item in analysis
-            }
-
-            st.markdown("#### Modification Details")
-            for i, mod in enumerate(modifications, 1):
-                rule_id = mod.get("rule_id", "")
-                sev = mod.get("severity", "P1")
-                severity_color = {"P0": "RED", "P1": "YELLOW", "P2": "GREEN"}.get(sev, "YELLOW")
-                icon = {"P0": "🔴", "P1": "🟡", "P2": "⚪"}.get(sev, "🟡")
+            # Per-clause revision details with AI reasoning
+            st.markdown("#### Revision Details")
+            for i, rev in enumerate(revisions, 1):
+                severity = rev.get("severity", "YELLOW")
+                icon = {"RED": "🔴", "YELLOW": "🟡", "GREEN": "🟢"}.get(severity, "🟡")
+                clause_id = rev.get("clause_id", "Clause")
+                rule_ids = rev.get("applicable_rule_ids", [])
+                rules_label = ", ".join(rule_ids) if rule_ids else ""
 
                 with st.expander(
-                    f"{icon} {i}. {mod.get('rule_title', 'Modification')} — {severity_color} ({sev})",
+                    f"{icon} {i}. {clause_id} — {severity}" + (f"  ({rules_label})" if rules_label else ""),
                     expanded=True,
                 ):
-                    # Redline diff for this modification
-                    orig = mod.get("original_fragment", "")
-                    modified = mod.get("modified_fragment", "")
-                    if orig and modified:
-                        mini_diff = generate_diff_html(orig, modified)
-                        st.markdown(f"<div class='clause-box'>{mini_diff}</div>", unsafe_allow_html=True)
+                    # AI Reasoning
+                    reasoning = rev.get("reasoning", "")
+                    if reasoning:
+                        st.markdown("**Reasoning:**")
+                        st.info(reasoning)
 
-                    st.markdown(f"**Explanation:** {mod.get('explanation', '—')}")
+                    # Clause-level redline diff
+                    orig = rev.get("original_clause", "")
+                    revised = rev.get("revised_clause", "")
+                    if orig and revised and orig != revised:
+                        clause_diff = generate_diff_html(orig, revised)
+                        st.markdown(
+                            f"<div class='clause-box'>{clause_diff}</div>",
+                            unsafe_allow_html=True,
+                        )
 
-                    analysis_item = analysis_by_rule.get(rule_id)
-                    rationale = analysis_item.get("rationale") or analysis_item.get("chain_of_thought") if analysis_item else None
-                    if rationale:
-                        st.markdown("**AI Rationale:**")
-                        st.info(rationale)
+                    # Structured changes list
+                    changes = rev.get("changes_made", [])
+                    if changes:
+                        st.markdown("**Changes:**")
+                        for ch in changes:
+                            rule = ch.get("rule_id", "")
+                            what = ch.get("what", "")
+                            why = ch.get("why", "")
+                            rule_tag = f" `({rule})`" if rule else ""
+                            st.markdown(f"- **{what}** — {why}{rule_tag}")
 
-                    # Show the modification plan
-                    if analysis_item and analysis_item.get("modification_plan"):
-                        with st.expander("Modification Plan (raw)", expanded=False):
-                            st.json(analysis_item["modification_plan"])
+                    # Show error if revision failed
+                    if rev.get("error"):
+                        st.error(f"Revision error: {rev['error']}")
 
         # Download buttons
         st.markdown("---")
@@ -711,13 +715,14 @@ def render_contract_review_tab():
                     final_text,
                     issues_list=issues or None,
                     modifications=modifications or None,
+                    revisions=revisions or None,
                     title=None,
                     redline_heading=None,
                     include_issues_list=False,
                     source_docx_bytes=st.session_state.get("review_source_docx_bytes"),
                 )
                 st.download_button(
-                    "📥 Download Redline (.docx)",
+                    "Download Redline (.docx)",
                     data=redline_buf,
                     file_name=f"redline_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -726,7 +731,7 @@ def render_contract_review_tab():
             with dl_col2:
                 clean_buf = generate_clean_docx(final_text, title="Contract — Clean Copy")
                 st.download_button(
-                    "📥 Download Clean Copy (.docx)",
+                    "Download Clean Copy (.docx)",
                     data=clean_buf,
                     file_name=f"clean_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -734,7 +739,7 @@ def render_contract_review_tab():
                 )
         with dl_col3 if generate_word and changed else dl_col1:
             st.download_button(
-                "📥 Download Modified Text (.txt)",
+                "Download Modified Text (.txt)",
                 data=final_text,
                 file_name=f"modified_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
                 mime="text/plain",
@@ -777,26 +782,29 @@ def render_contract_review_tab():
 
     # ── Tab: Analysis Detail ─────────────────────────────────────
     with detail_tabs[2]:
-        st.markdown(f"### Rule-by-Rule Analysis ({len(analysis)} rules)")
+        st.markdown(f"### Clause-by-Clause Analysis ({len(analysis)} items)")
         for item in analysis:
             status = item.get("compliance_status", "unknown")
             icon = {"compliant": "✅", "non_compliant": "🔴", "partially_compliant": "🟡"}.get(status, "❓")
-            rule_title = item.get("rule_title", item.get("rule_id", "Rule"))
-            source = item.get("source_playbook", "")
+            clause_id = item.get("clause_id", "unknown")
+            severity = item.get("severity", "")
+            rule_ids = item.get("applicable_rule_ids", [])
 
-            with st.expander(f"{icon} {rule_title} — {status.upper()}", expanded=(status != "compliant")):
-                st.caption(f"Rule ID: {item.get('rule_id','')}  ·  Type: {item.get('rule_type','')}  ·  Source: {source}")
-                st.markdown(f"**Matched Clause:** {item.get('clause_location','—')}")
-                if item.get("matched_clause"):
-                    st.code(item["matched_clause"][:500], language="text")
+            with st.expander(
+                f"{icon} {clause_id} — {status.upper()} ({severity})",
+                expanded=(status != "compliant"),
+            ):
+                st.caption(
+                    f"Rules: {', '.join(rule_ids) if isinstance(rule_ids, list) else rule_ids}  ·  "
+                    f"Location: {item.get('clause_location', '—')}"
+                )
+                if item.get("clause_text"):
+                    st.code(item["clause_text"][:600], language="text")
 
-                st.markdown("**Rationale:**")
-                st.markdown(item.get("rationale") or item.get("chain_of_thought", "—"))
-
-                if item.get("modification_needed"):
-                    plan = item.get("modification_plan", {})
-                    st.markdown("**Modification Plan:**")
-                    st.json(plan)
+                gaps = item.get("gaps", "")
+                if gaps:
+                    st.markdown("**Gap Assessment:**")
+                    st.markdown(gaps)
 
     # ── Tab: LLM Stats ───────────────────────────────────────────
     with detail_tabs[3]:
