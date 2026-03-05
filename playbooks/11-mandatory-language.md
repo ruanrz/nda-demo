@@ -18,6 +18,8 @@ These three rules are vital "Safe Harbor" provisions for investment firms and pr
 
 ## 2. The Rules (Standardized Text)
 
+**Capitalization:** Use lowercase for common nouns: "affiliates", "portfolio companies", "representative" (when not the defined term). Capitalize only defined terms: "Company", "Agreement", "Evaluation Material", "Dual Representative", "Representatives".
+
 ### Rule A: Dual Representative Safe Harbor
 
 "The Company acknowledges that certain directors, officers, and employees who serve on the board of directors (or similar governing body) of one or more of your affiliates or portfolio companies may also serve as a representative of you in another position or role (a "Dual Representative") and no such affiliates or portfolio companies will be deemed to have received such Evaluation Materials solely as a result of such dual role of any such Dual Representative, provided that such Dual Representative shall not have directly or indirectly disclosed any Evaluation Material to such affiliate or portfolio company."

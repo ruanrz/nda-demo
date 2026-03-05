@@ -3,7 +3,7 @@ AI Legal Assistant — Contract Review Demo
 
 Architecture (v3):
   - Unified pipeline: analysis (LLM) → execution (local + LLM fallback) → issues (LLM)
-  - Model preset: quality (o3 + gpt-4o)
+  - Multi-provider: OpenAI (quality/cost presets) and Google Gemini 3.1 Pro
   - Word Track Changes output
   - Issues List / Risk Summary
   - Own Paper + Counterparty Paper modes
@@ -58,8 +58,16 @@ try:
         load_playbooks_from_markdown,
         load_playbooks_for_display,
     )
+    from providers.llm_client import (
+        PRESETS,
+        PROVIDER_LABELS,
+        GEMINI_BASE_URL,
+        LLMClient,
+        reset_llm_client,
+        _is_gemini_preset,
+    )
     UNIFIED_AVAILABLE = True
-    logger.info("Unified review pipeline loaded (OpenAI)")
+    logger.info("Unified review pipeline loaded")
 except Exception as e:
     UNIFIED_AVAILABLE = False
     logger.warning(f"Unified pipeline unavailable: {e}")
@@ -353,10 +361,52 @@ def _extract_docx_text_with_numbering(content: bytes) -> str:
     return "\n\n".join(extracted)
 
 
+def _extract_paragraphs_including_sdt(doc: Document):
+    """
+    Extract paragraph text in document order, including content from sdt
+    (structured document tags / content controls) which python-docx normally skips.
+    Placeholders like [Date], [CLIENT NAME] inside content controls are preserved.
+    """
+    body = doc.element.body
+    blocks = []
+
+    for child in body:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag == "p":
+            texts = []
+            for t in child.iter():
+                if t.tag.endswith("}t") and t.text:
+                    texts.append(t.text)
+            block_text = "".join(texts).strip()
+            if block_text:
+                blocks.append(block_text)
+        elif tag == "sdt":
+            # Extract text from w:sdtContent/w:p (content controls)
+            sdt_content = None
+            for elem in child.iter():
+                if elem.tag.split("}")[-1] == "sdtContent":
+                    sdt_content = elem
+                    break
+            if sdt_content is not None:
+                for p_elem in sdt_content.iter():
+                    if p_elem.tag.endswith("}p"):
+                        texts = []
+                        for t in p_elem.iter():
+                            if t.tag.endswith("}t") and t.text:
+                                texts.append(t.text)
+                        block_text = "".join(texts).strip()
+                        if block_text:
+                            blocks.append(block_text)
+                        break  # Typically one paragraph per sdtContent
+
+    return blocks
+
+
 def parse_uploaded_contract(uploaded_file, store_source_docx: bool = False):
     if not uploaded_file:
         if store_source_docx:
             st.session_state.pop("review_source_docx_bytes", None)
+            st.session_state.pop("review_source_docx_name", None)
         return None
     name = uploaded_file.name.lower()
     if name.endswith(".docx"):
@@ -364,19 +414,24 @@ def parse_uploaded_contract(uploaded_file, store_source_docx: bool = False):
             content = uploaded_file.read()
             if store_source_docx:
                 st.session_state["review_source_docx_bytes"] = content
+                st.session_state["review_source_docx_name"] = uploaded_file.name
             doc = Document(BytesIO(content))
-            return "\n\n".join(p.text.strip() for p in doc.paragraphs if p.text.strip())
+            blocks = _extract_paragraphs_including_sdt(doc)
+            return "\n\n".join(blocks)
         except Exception as e:
             if store_source_docx:
                 st.session_state.pop("review_source_docx_bytes", None)
+                st.session_state.pop("review_source_docx_name", None)
             st.warning(f".docx parsing failed: {e}")
             return None
     elif name.endswith(".txt"):
         if store_source_docx:
             st.session_state.pop("review_source_docx_bytes", None)
+            st.session_state.pop("review_source_docx_name", None)
         return uploaded_file.read().decode("utf-8")
     if store_source_docx:
         st.session_state.pop("review_source_docx_bytes", None)
+        st.session_state.pop("review_source_docx_name", None)
     st.warning("Only .docx and .txt files are supported.")
     return None
 
@@ -387,13 +442,13 @@ def _friendly_review_error_message(err: Exception) -> str:
     lower = text.lower()
     if "unsupported_country_region_territory" in lower:
         return (
-            "OpenAI 请求被地区策略拒绝。请配置可访问的 OpenAI 兼容 endpoint（设置 "
-            "`OPENAI_API_BASE` 或 `OPENAI_BASE_URL`），并确保所选模型在该 endpoint 可用。"
+            "LLM 请求被地区策略拒绝。请配置可访问的兼容 endpoint，"
+            "或尝试切换到 Google Gemini 模型。"
         )
     if "invalid_api_key" in lower or "authentication" in lower:
-        return "OpenAI 鉴权失败。请检查 `OPENAI_API_KEY` 是否正确并重新启动应用。"
+        return "API 鉴权失败。请检查 API Key 是否正确并重新启动应用。"
     if "insufficient_quota" in lower or "quota" in lower:
-        return "OpenAI 配额不足或账单受限。请检查账号额度与 billing 状态。"
+        return "API 配额不足或账单受限。请检查账号额度与 billing 状态。"
     return text
 
 
@@ -433,8 +488,8 @@ def load_playbook_display_rules(path: str = PLAYBOOK_FINAL_FILE):
 def main():
     st.title("AI Legal Assistant")
     st.caption(
-        "Surgical-precision contract redlining powered by OpenAI  ·  "
-        "Playbook-driven  ·  Minimalist modifications"
+        "Surgical-precision contract redlining powered by AI  ·  "
+        "OpenAI & Gemini  ·  Playbook-driven  ·  Minimalist modifications"
     )
 
     tabs = ["📄 Contract Review", "📚 Rule Learning", "🧠 Rule Management"]
@@ -456,7 +511,7 @@ def render_contract_review_tab():
     if not UNIFIED_AVAILABLE:
         st.error(
             "Unified review pipeline not available. "
-            "Please set the OPENAI_API_KEY environment variable and restart."
+            "Please set OPENAI_API_KEY or GOOGLE_API_KEY and restart."
         )
         return
 
@@ -509,8 +564,40 @@ def render_contract_review_tab():
     mode = "own_paper"
     generate_issues = True
     generate_word = True
-    preset = "quality"
+
+    # ── Model selector ───────────────────────────────────────────
+    st.markdown("### 🤖 Model Selection")
+    preset_options = list(PROVIDER_LABELS.keys())
+    preset_labels = list(PROVIDER_LABELS.values())
+    selected_label = st.selectbox(
+        "Select LLM Provider / Model",
+        options=preset_labels,
+        index=preset_labels.index(PROVIDER_LABELS.get(
+            st.session_state.get("selected_preset", "gemini"), preset_labels[0]
+        )),
+        help="Choose the LLM backend. Gemini 3.1 Pro uses Google's API (requires GOOGLE_API_KEY).",
+    )
+    preset = preset_options[preset_labels.index(selected_label)]
+    st.session_state["selected_preset"] = preset
     os.environ["MODEL_PRESET"] = preset
+
+    is_gemini = _is_gemini_preset(preset)
+    if is_gemini:
+        api_key_present = bool(
+            os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        )
+        if not api_key_present:
+            st.warning(
+                "Gemini 模式需要设置 `GOOGLE_API_KEY` 环境变量。"
+                " 请在启动应用前设置：`export GOOGLE_API_KEY=your_key`"
+            )
+    else:
+        api_key_present = bool(os.environ.get("OPENAI_API_KEY"))
+
+    routing = PRESETS.get(preset, {})
+    with st.expander("Model routing details", expanded=False):
+        for task, model in routing.items():
+            st.caption(f"`{task}` → `{model}`")
 
     st.markdown("### 📄 Contract Text")
     uploaded = st.file_uploader(
@@ -520,6 +607,7 @@ def render_contract_review_tab():
     uploaded_text = parse_uploaded_contract(uploaded, store_source_docx=True) if uploaded else None
     if not uploaded:
         st.session_state.pop("review_source_docx_bytes", None)
+        st.session_state.pop("review_source_docx_name", None)
 
     contract_text = st.text_area(
         "Contract Text",
@@ -542,20 +630,28 @@ def render_contract_review_tab():
         )
         return
 
-    if not os.environ.get("OPENAI_API_KEY"):
-        st.error("Missing OPENAI_API_KEY. Please set it in your shell before starting the app.")
-        return
+    if is_gemini:
+        if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+            st.error("Missing GOOGLE_API_KEY. Please set it in your shell before starting the app.")
+            return
+    else:
+        if not os.environ.get("OPENAI_API_KEY"):
+            st.error("Missing OPENAI_API_KEY. Please set it in your shell before starting the app.")
+            return
 
     if not contract_text.strip():
         st.error("Contract text is empty.")
         return
 
-    endpoint = (
-        os.environ.get("OPENAI_API_BASE")
-        or os.environ.get("OPENAI_BASE_URL")
-        or "https://api.openai.com/v1"
-    )
-    st.caption(f"LLM endpoint: `{endpoint}`")
+    if is_gemini:
+        endpoint = GEMINI_BASE_URL
+    else:
+        endpoint = (
+            os.environ.get("OPENAI_API_BASE")
+            or os.environ.get("OPENAI_BASE_URL")
+            or "https://api.openai.com/v1"
+        )
+    st.caption(f"Provider: **{PROVIDER_LABELS.get(preset, preset)}**  ·  Endpoint: `{endpoint}`")
 
     # ── Execute pipeline ─────────────────────────────────────────
     progress_bar = st.progress(0)
@@ -587,10 +683,16 @@ def render_contract_review_tab():
             return
         on_progress("parsing", f"Loaded {len(playbook_entries)} of {len(selected_ids)} playbooks")
 
+        reset_llm_client()
+        client = LLMClient(preset=preset)
+
         result = unified_review_contract(
             contract_text=contract_text,
             playbook_entries=playbook_entries,
             mode=mode,
+            client=client,
+            source_docx_bytes=st.session_state.get("review_source_docx_bytes"),
+            source_docx_name=st.session_state.get("review_source_docx_name", "contract.docx"),
             generate_issues=generate_issues,
             progress_callback=on_progress,
             playbook_source="markdown",
@@ -609,7 +711,9 @@ def render_contract_review_tab():
 
     # ── Display results ──────────────────────────────────────────
     final_text = result.get("final_text", contract_text)
+    final_text_for_redline = result.get("final_text_revisions_only", final_text)
     revisions = result.get("revisions", [])
+    insertions = result.get("insertions", [])
     modifications = result.get("modifications", [])
     analysis = result.get("analysis", [])
     issues = result.get("issues_list", [])
@@ -712,10 +816,11 @@ def render_contract_review_tab():
             with dl_col1:
                 redline_buf = generate_redline_docx(
                     contract_text,
-                    final_text,
+                    final_text_for_redline,
                     issues_list=issues or None,
                     modifications=modifications or None,
                     revisions=revisions or None,
+                    insertions=insertions or None,
                     title=None,
                     redline_heading=None,
                     include_issues_list=False,

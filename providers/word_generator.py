@@ -14,6 +14,7 @@ When rationale cannot be encoded in revision metadata, attach one concise
 comment per changed paragraph/revision anchor.
 """
 
+import copy
 import io
 import re
 from datetime import datetime, timezone
@@ -45,7 +46,7 @@ _PARA_PUNCT_MAP = str.maketrans({
     "\u00a0": " ",
 })
 
-_WORD_TOKEN_RE = re.compile(r"\S+|\s+")
+_WORD_TOKEN_RE = re.compile(r"\w+|[^\w\s]|\s+")
 
 
 def generate_redline_docx(
@@ -54,6 +55,7 @@ def generate_redline_docx(
     issues_list: Optional[List[Dict[str, Any]]] = None,
     modifications: Optional[List[Dict[str, Any]]] = None,
     revisions: Optional[List[Dict[str, Any]]] = None,
+    insertions: Optional[List[Dict[str, Any]]] = None,
     title: Optional[str] = None,
     redline_heading: Optional[str] = None,
     include_issues_list: bool = False,
@@ -108,6 +110,10 @@ def generate_redline_docx(
             doc, original_text, modified_text, modifications or [], revisions=revisions
         )
 
+    # ── Inserted clauses (Step 2b) — added as pure tracked insertions ──
+    if insertions:
+        _add_insertion_paragraphs(doc, insertions)
+
     # ── Issues List table ────────────────────────────────────────
     if include_issues_list and issues_list:
         doc.add_page_break()
@@ -128,10 +134,14 @@ def generate_redline_docx(
 def compute_word_diffs(text1: str, text2: str):
     """Word-level diff using diff_match_patch.
 
-    Tokenizes both texts into words and whitespace runs, maps each unique
-    token to a single Unicode character, diffs the encoded strings, then
-    decodes back.  The result has the same (op, text) format as
-    ``dmp.diff_main`` but every chunk is aligned to word boundaries.
+    Tokenizes both texts into words, punctuation, and whitespace runs,
+    maps each unique token to a single Unicode character, diffs the encoded
+    strings, then decodes back.  The result has the same (op, text) format
+    as ``dmp.diff_main`` but every chunk is aligned to token boundaries.
+
+    A refinement pass extracts common token-level prefixes/suffixes from
+    adjacent DELETE/INSERT pairs so that unchanged words are never marked
+    as edited.
     """
     dmp = dmp_module.diff_match_patch()
     dmp.Diff_Timeout = 120
@@ -163,7 +173,90 @@ def compute_word_diffs(text1: str, text2: str):
     for op, data in diffs:
         decoded = "".join(token_array[ord(c)] for c in data)
         result.append((op, decoded))
+
+    result = _refine_diffs(result)
+    result = _merge_adjacent_diffs(result)
     return result
+
+
+def _refine_diffs(
+    diffs: List[tuple],
+) -> List[tuple]:
+    """Extract common token-level prefixes/suffixes from DELETE/INSERT pairs.
+
+    When diff_match_patch marks "Company" as deleted and "Company, as defined
+    by applicable law," as inserted, this function detects that "Company" is
+    a shared prefix and splits the pair into EQUAL("Company") + INSERT(rest),
+    producing minimal, precise redlines.
+    """
+    EQUAL = dmp_module.diff_match_patch.DIFF_EQUAL
+    DELETE = dmp_module.diff_match_patch.DIFF_DELETE
+    INSERT = dmp_module.diff_match_patch.DIFF_INSERT
+
+    refined: List[tuple] = []
+    i = 0
+    while i < len(diffs):
+        if (
+            i + 1 < len(diffs)
+            and diffs[i][0] == DELETE
+            and diffs[i + 1][0] == INSERT
+        ):
+            del_text = diffs[i][1]
+            ins_text = diffs[i + 1][1]
+
+            del_tokens = _WORD_TOKEN_RE.findall(del_text)
+            ins_tokens = _WORD_TOKEN_RE.findall(ins_text)
+
+            prefix_len = 0
+            for a, b in zip(del_tokens, ins_tokens):
+                if a == b:
+                    prefix_len += 1
+                else:
+                    break
+
+            del_rest = del_tokens[prefix_len:]
+            ins_rest = ins_tokens[prefix_len:]
+            suffix_len = 0
+            for a, b in zip(reversed(del_rest), reversed(ins_rest)):
+                if a == b:
+                    suffix_len += 1
+                else:
+                    break
+
+            if prefix_len > 0:
+                refined.append((EQUAL, "".join(del_tokens[:prefix_len])))
+
+            end_del = len(del_tokens) - suffix_len if suffix_len else len(del_tokens)
+            end_ins = len(ins_tokens) - suffix_len if suffix_len else len(ins_tokens)
+            mid_del = del_tokens[prefix_len:end_del]
+            mid_ins = ins_tokens[prefix_len:end_ins]
+
+            if mid_del:
+                refined.append((DELETE, "".join(mid_del)))
+            if mid_ins:
+                refined.append((INSERT, "".join(mid_ins)))
+
+            if suffix_len > 0:
+                refined.append((EQUAL, "".join(del_tokens[end_del:])))
+
+            i += 2
+        else:
+            refined.append(diffs[i])
+            i += 1
+    return refined
+
+
+def _merge_adjacent_diffs(diffs: List[tuple]) -> List[tuple]:
+    """Merge consecutive diff entries that share the same operation."""
+    if not diffs:
+        return diffs
+    merged = [diffs[0]]
+    for op, text in diffs[1:]:
+        if op == merged[-1][0]:
+            merged[-1] = (op, merged[-1][1] + text)
+        else:
+            merged.append((op, text))
+    return merged
 
 
 def _iso_now_utc() -> str:
@@ -609,6 +702,51 @@ def _split_contract_paragraphs(text: str) -> List[str]:
     return [p.strip() for p in chunks if p.strip()]
 
 
+def _get_body_blocks_with_paragraphs(doc: Document) -> List[tuple]:
+    """
+    Return [(Paragraph, block_text), ...] in document order, including content
+    from sdt (content controls). Aligns with extraction that includes sdt.
+    """
+    body = doc.element.body
+    blocks: List[tuple] = []
+    para_to_elem = {id(p._p): p for p in doc.paragraphs}
+
+    for child in body:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag == "p":
+            texts = []
+            for t in child.iter():
+                if t.tag.endswith("}t") and t.text:
+                    texts.append(t.text)
+            block_text = "".join(texts).strip()
+            if block_text:
+                para = para_to_elem.get(id(child))
+                if para is not None:
+                    blocks.append((para, block_text))
+        elif tag == "sdt":
+            sdt_content = None
+            for elem in child.iter():
+                if elem.tag.split("}")[-1] == "sdtContent":
+                    sdt_content = elem
+                    break
+            if sdt_content is not None:
+                for p_elem in sdt_content.iter():
+                    if p_elem.tag.endswith("}p"):
+                        texts = []
+                        for t in p_elem.iter():
+                            if t.tag.endswith("}t") and t.text:
+                                texts.append(t.text)
+                        block_text = "".join(texts).strip()
+                        if block_text:
+                            parent = p_elem.getparent()
+                            if parent is not None:
+                                para = Paragraph(p_elem, parent)
+                                blocks.append((para, block_text))
+                        break
+
+    return blocks
+
+
 def _add_redline_paragraphs_from_template(
     doc: Document,
     original: str,
@@ -625,7 +763,9 @@ def _add_redline_paragraphs_from_template(
     if not orig_paras and not mod_paras:
         return
 
-    existing_paras = [p for p in doc.paragraphs if (p.text or "").strip()]
+    # Build existing_paras in same order as extraction (including sdt content controls)
+    blocks = _get_body_blocks_with_paragraphs(doc)
+    existing_paras = [p for p, _ in blocks]
     while len(existing_paras) < len(orig_paras):
         existing_paras.append(doc.add_paragraph())
 
@@ -742,6 +882,168 @@ def _add_redline_paragraphs_from_template(
                     date_iso=date_iso,
                     revisions=revisions,
                 )
+
+
+_SIGNATURE_MARKERS = (
+    "Very truly yours",
+    "Sincerely",
+    "IN WITNESS WHEREOF",
+    "(Remainder of page intentionally left blank)",
+)
+
+
+def _sort_insertions_for_mandatory_order(insertions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Sort insertions so mandatory_language clauses appear in playbook order:
+    A (Dual Representative) first, B (Non-Restriction) second, C (Data Room) third.
+    Blind NDA (if present) comes before the three mandatory clauses.
+    """
+    def _order_key(ins: Dict[str, Any]) -> int:
+        text = (ins.get("clause_text") or "").lower()
+        if "identity disclosure" in text or "conflict check" in text or "conflicts check" in text:
+            return 0  # Blind NDA first
+        if "dual representative" in text:
+            return 1  # Rule A
+        if "investment business" in text and "competitors" in text:
+            return 2  # Rule B
+        if "electronic data room" in text and ("modified" in text or "amended" in text):
+            return 3  # Rule C
+        return 4  # Other insertions last
+
+    return sorted(insertions, key=_order_key)
+
+
+def _find_insertion_anchor(doc: Document) -> Optional[Paragraph]:
+    """
+    Find the anchor for insertions: the paragraph immediately AFTER the last
+    numbered body paragraph. Inserting before this keeps numbering continuous.
+    """
+    paras = list(doc.paragraphs)
+    last_num_idx = -1
+    for i, p in enumerate(paras):
+        pPr = p._p.find(qn("w:pPr"))
+        if pPr is not None and pPr.find(qn("w:numPr")) is not None:
+            last_num_idx = i
+
+    if last_num_idx < 0:
+        for para in paras:
+            if "Very truly yours" in (para.text or ""):
+                return para
+        return None
+
+    next_idx = last_num_idx + 1
+    if next_idx < len(paras):
+        return paras[next_idx]
+    return paras[last_num_idx] if last_num_idx >= 0 else None
+
+
+def _find_signature_anchor(doc: Document) -> Optional[Paragraph]:
+    """Find the first paragraph that contains a signature/closing marker."""
+    for para in doc.paragraphs:
+        text = (para.text or "").strip()
+        for marker in _SIGNATURE_MARKERS:
+            if marker in text:
+                return para
+    return None
+
+
+def _get_style_and_num_pr(doc: Document, anchor: Optional[Paragraph]) -> tuple:
+    """Get style and numPr from the last numbered body paragraph before the anchor."""
+    paras = list(doc.paragraphs)
+    start_idx = len(paras) - 1
+    if anchor is not None:
+        for idx, p in enumerate(paras):
+            if p is anchor:
+                start_idx = idx - 1
+                break
+    for i in range(start_idx, -1, -1):
+        p = paras[i]
+        p_elm = p._p
+        pPr = p_elm.find(qn("w:pPr"))
+        if pPr is None:
+            continue
+        numPr = pPr.find(qn("w:numPr"))
+        if numPr is not None:
+            return p.style, numPr
+    return None, None
+
+
+def _apply_paragraph_format(para: Paragraph, style_source, num_pr_source) -> None:
+    """Apply style and numbering to a paragraph to match the document body."""
+    p_elm = para._p
+    pPr = p_elm.find(qn("w:pPr"))
+    if pPr is None:
+        pPr = OxmlElement("w:pPr")
+        p_elm.insert(0, pPr)
+    if style_source is not None:
+        try:
+            para.style = style_source
+        except Exception:
+            pass
+    if num_pr_source is not None:
+        existing_num = pPr.find(qn("w:numPr"))
+        if existing_num is not None:
+            pPr.remove(existing_num)
+        pPr.append(num_pr_source)
+
+
+def _add_insertion_paragraphs(doc: Document, insertions: List[Dict[str, Any]]) -> None:
+    """
+    Append Step 2b insertion clauses as pure tracked-insert paragraphs,
+    placed immediately after the last numbered body paragraph for continuous
+    numbering. Order: Blind NDA (if any), then mandatory_language A, B, C.
+    """
+    if not insertions:
+        return
+
+    insertions = _sort_insertions_for_mandatory_order(insertions)
+    anchor = _find_insertion_anchor(doc)
+    if anchor is None:
+        anchor = _find_signature_anchor(doc)
+    style_source, num_pr_source = _get_style_and_num_pr(doc, anchor)
+    author = "AI Legal Assistant"
+    date_iso = _iso_now_utc()
+    revision_id = 9000
+
+    for ins in reversed(insertions):
+        clause_text = (ins.get("clause_text") or "").strip()
+        if not clause_text:
+            continue
+
+        chunks = [c.strip() for c in clause_text.split("\n\n") if c.strip()]
+
+        # When inserting before an anchor, each insert_paragraph_before +
+        # anchor update reverses iteration order (same reason the outer loop
+        # uses reversed()).  Reverse chunks so they end up in source order.
+        # When appending (anchor is None), forward order is already correct.
+        ordered_chunks = list(reversed(chunks)) if anchor is not None else chunks
+
+        for chunk in ordered_chunks:
+            if anchor is not None:
+                para = anchor.insert_paragraph_before("")
+            else:
+                para = doc.add_paragraph()
+
+            _clear_paragraph_content(para)
+            if num_pr_source is not None:
+                _apply_paragraph_format(para, style_source, copy.deepcopy(num_pr_source))
+            elif style_source is not None:
+                try:
+                    para.style = style_source
+                except Exception:
+                    pass
+
+            _append_tracked_insert(
+                para=para,
+                text=chunk,
+                revision_id=revision_id,
+                author=author,
+                date_iso=date_iso,
+            )
+            revision_id += 1
+
+            if anchor is not None:
+                anchor = para
 
 
 def _short_reason(reason: str, max_len: int = 500) -> str:

@@ -10,7 +10,7 @@ priority: P1
 
 ## 1. Rule Summary
 
-**Trigger:** Any NDA where the Disclosing Party (Company) identity is initially withheld or replaced with a code name.
+**Trigger:** Any NDA where the Disclosing Party (Company) identity is initially withheld or replaced with a code name **in the body of the agreement** (e.g., "a company" or "[Company Name]" as the disclosing party). Do NOT trigger merely because the signature block has a placeholder like "[CLIENT NAME]" — that is standard for unsigned drafts.
 
 | Logic Condition | AI Polished Action |
 |-----------------|-------------------|

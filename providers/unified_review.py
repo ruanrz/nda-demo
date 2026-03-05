@@ -28,6 +28,8 @@ from .unified_prompts import (
     ANALYSIS_USER_PROMPT,
     REVISION_SYSTEM_PROMPT,
     REVISION_USER_PROMPT,
+    INSERTION_SYSTEM_PROMPT,
+    INSERTION_USER_PROMPT,
     ISSUES_LIST_SYSTEM_PROMPT,
     ISSUES_LIST_USER_PROMPT,
     OWN_PAPER_MODE,
@@ -48,6 +50,8 @@ def unified_review_contract(
     playbook_entries: Optional[List[Dict[str, Any]]] = None,
     mode: str = "own_paper",
     client: Optional[LLMClient] = None,
+    source_docx_bytes: Optional[bytes] = None,
+    source_docx_name: str = "contract.docx",
     generate_issues: bool = True,
     progress_callback=None,
     playbook_source: str = "markdown",
@@ -74,6 +78,7 @@ def unified_review_contract(
         "defined_terms": {},
         "revisions": [],
         "modifications": [],
+        "insertions": [],
         "final_text": contract_text,
         "issues_list": [],
         "executive_summary": "",
@@ -88,16 +93,11 @@ def unified_review_contract(
         if progress_callback:
             progress_callback(stage, detail)
 
-    # ── Step 0: local structure parsing ──────────────────────────
-    _progress("parsing", "Parsing contract structure…")
-    clauses = parse_contract_structure(contract_text)
-    result["contract_structure"] = [c.to_dict() for c in clauses]
-    result["step_trace"].append({
-        "step": "Step 0", "name": "Parsing",
-        "engine": "Local parser",
-        "thinking": [f"Detected {len(clauses)} structural clauses/sections."],
-        "output": {"clauses_detected": len(clauses)},
-    })
+    # ── Step 0: local structure parsing (disabled) ─────────────
+    # parse_contract_structure output is not consumed downstream;
+    # Step 1 sends the full contract_text to the LLM directly.
+    # clauses = parse_contract_structure(contract_text)
+    # result["contract_structure"] = [c.to_dict() for c in clauses]
 
     # ── Load playbooks if not provided ───────────────────────────
     if playbook_entries is None:
@@ -111,16 +111,32 @@ def unified_review_contract(
     _progress("analysis", "Analysing contract against all Playbook rules…")
     logger.info("Step 1: Analysis call (preset=%s)", client.preset_name)
 
-    analysis_result = client.call_json(
-        task_type="analysis",
-        system_prompt=ANALYSIS_SYSTEM_PROMPT,
-        user_prompt=ANALYSIS_USER_PROMPT.format(
+    analysis_kwargs: Dict[str, Any] = {
+        "task_type": "analysis",
+        "system_prompt": ANALYSIS_SYSTEM_PROMPT,
+        "user_prompt": ANALYSIS_USER_PROMPT.format(
             playbook_rules=rules_text,
             contract_text=contract_text,
             mode_instruction=mode_instruction,
         ),
-        temperature=0.0,
-        max_tokens=16384,
+        "temperature": 0.0,
+        "max_tokens": 16384,
+    }
+    if getattr(client, "is_gemini_provider", lambda: False)():
+        analysis_kwargs["file_attachments"] = _build_playbook_file_attachments(playbook_entries)
+    # Gemini best-effort document grounding: attach source DOCX when available.
+    if (
+        source_docx_bytes
+        and getattr(client, "is_gemini_provider", lambda: False)()
+    ):
+        analysis_kwargs.update({
+            "document_bytes": source_docx_bytes,
+            "document_name": source_docx_name or "contract.docx",
+            "document_mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        })
+
+    analysis_result = client.call_json(
+        **analysis_kwargs,
     )
 
     defined_terms = analysis_result.get("defined_terms", {})
@@ -135,10 +151,22 @@ def unified_review_contract(
         c for c in clause_analysis
         if c.get("compliance_status") != "compliant"
         and c.get("severity") != "GREEN"
+        and c.get("clause_text", "").strip()
     ]
 
+    missing_rule_analyses = [
+        c for c in clause_analysis
+        if c.get("compliance_status") != "compliant"
+        and c.get("severity") != "GREEN"
+        and not c.get("clause_text", "").strip()
+    ]
+    missing_rule_ids: set = set()
+    for item in missing_rule_analyses:
+        for rid in (item.get("applicable_rule_ids") or []):
+            missing_rule_ids.add(rid)
+
     # Group by clause_text to avoid revising the same clause multiple times
-    clause_groups = _group_analyses_by_clause(clauses_needing_revision)
+    clause_groups = _group_analyses_by_clause(clauses_needing_revision, playbook_entries)
 
     logger.info(
         "Analysis: %d rules checked, %d unique clauses need revision",
@@ -165,6 +193,22 @@ def unified_review_contract(
             "overall_risk": analysis_summary.get("overall_risk", "unknown"),
         },
     })
+    print(f"\n{'#'*80}")
+    print(f"  STEP 1: ANALYSIS RESULT")
+    print(f"{'#'*80}")
+    print(f"  Rules checked: {analysis_summary.get('total_rules_checked', len(clause_analysis))}")
+    print(f"  Compliant: {analysis_summary.get('compliant', 0)}")
+    print(f"  Non-compliant: {analysis_summary.get('non_compliant', 0)}")
+    print(f"  Overall risk: {analysis_summary.get('overall_risk', '?')}")
+    print(f"  Clauses needing revision: {len(clause_groups)}")
+    for item in clause_analysis:
+        status = item.get("compliance_status", "?")
+        cid = item.get("clause_id", "?")
+        sev = item.get("severity", "?")
+        mark = "✅" if status == "compliant" else "❌"
+        print(f"    {mark} {cid} [{sev}] {status}")
+    print()
+
     _progress(
         "analysis_done",
         f"Found {len(clause_groups)} clauses to revise across "
@@ -215,6 +259,28 @@ def unified_review_contract(
                 "total_changes": sum(len(r.get("changes_made", [])) for r in revisions),
             },
         })
+
+        print(f"\n{'#'*80}")
+        print(f"  STEP 2: REVISION RESULTS  ({len(revisions)} clauses revised)")
+        print(f"{'#'*80}")
+        for i, rev in enumerate(revisions, 1):
+            cid = rev.get("clause_id", "?")
+            sev = rev.get("severity", "?")
+            reasoning = rev.get("reasoning", "")
+            changes = rev.get("changes_made", [])
+            print(f"\n  --- Clause {i}: {cid} [{sev}] ---")
+            print(f"  Reasoning: {reasoning}")
+            for ch in changes:
+                print(f"    • {ch.get('what','')} — {ch.get('why','')}")
+            orig = rev.get("original_clause", "")
+            revised = rev.get("revised_clause", "")
+            if orig != revised and revised:
+                print(f"  [Original]\n{orig}")
+                print(f"  [Revised]\n{revised}")
+            if rev.get("error"):
+                print(f"  ⚠ ERROR: {rev['error']}")
+        print()
+
         _progress("execution_done", f"Revised {len(revisions)} clauses")
     else:
         _progress("execution_done", "No revisions needed — contract is compliant")
@@ -225,9 +291,102 @@ def unified_review_contract(
             "output": {"clauses_revised": 0},
         })
 
+    # ── Step 2b: Insert missing clauses (1 LLM call) ─────────────
+    insertions: List[Dict[str, Any]] = []
+    if missing_rule_ids:
+        _progress("insertion", f"Drafting {len(missing_rule_ids)} missing clauses…")
+        logger.info("Step 2b: Inserting clauses for %d missing rules", len(missing_rule_ids))
+
+        missing_rules_text = get_rules_text_by_ids(
+            list(missing_rule_ids), playbook_entries
+        )
+        defined_terms_str_ins = json.dumps(defined_terms, ensure_ascii=False, indent=2)
+
+        insertion_kwargs: Dict[str, Any] = {
+            "task_type": "insertion",
+            "system_prompt": INSERTION_SYSTEM_PROMPT,
+            "user_prompt": INSERTION_USER_PROMPT.format(
+                contract_text=contract_text,
+                missing_rules=missing_rules_text,
+                defined_terms=defined_terms_str_ins,
+            ),
+            "temperature": 0.1,
+            "max_tokens": 8192,
+        }
+
+        insertion_result = client.call_json(**insertion_kwargs)
+        insertions = insertion_result.get("insertions", [])
+        result["insertions"] = insertions
+
+        for ins in insertions:
+            for ch in ins.get("changes_made", []):
+                result["modifications"].append({
+                    "rule_id": ch.get("rule_id", ""),
+                    "rule_title": ch.get("what", ""),
+                    "original_fragment": "",
+                    "modified_fragment": ins.get("clause_text", "")[:200],
+                    "modification_type": "insertion",
+                    "explanation": ch.get("why", ""),
+                    "severity": "P0",
+                })
+
+        ins_thinking = []
+        for ins in insertions:
+            reasoning = ins.get("reasoning", "")
+            heading = ins.get("clause_heading", "?")
+            ins_thinking.append(f"{heading}: {reasoning[:150]}")
+
+        result["step_trace"].append({
+            "step": "Step 2b", "name": "Insertion",
+            "engine": f"LLM ({client.routing.get('insertion', 'default')})",
+            "thinking": ins_thinking[:8],
+            "output": {
+                "clauses_inserted": len(insertions),
+                "total_changes": sum(len(i.get("changes_made", [])) for i in insertions),
+            },
+        })
+
+        print(f"\n{'#'*80}")
+        print(f"  STEP 2b: INSERTION RESULTS  ({len(insertions)} clauses drafted)")
+        print(f"{'#'*80}")
+        for i, ins in enumerate(insertions, 1):
+            heading = ins.get("clause_heading", "?")
+            rid = ins.get("rule_id", "?")
+            reasoning = ins.get("reasoning", "")
+            insert_after = ins.get("insert_after", "?")
+            print(f"\n  --- Insertion {i}: {heading} (rule={rid}) ---")
+            print(f"  Insert after: {insert_after}")
+            print(f"  Reasoning: {reasoning}")
+            clause_preview = ins.get("clause_text", "")[:300]
+            print(f"  [Clause preview]\n{clause_preview}…")
+        print()
+
+        _progress("insertion_done", f"Drafted {len(insertions)} new clauses")
+
     # ── Step 3: Assembly — stitch revised clauses back ───────────
     final_text = _assemble_final_text(contract_text, result["revisions"])
+
+    # Keep revision-only text for clean paragraph-aligned redline diff.
+    # Insertions are passed separately to the Word generator so they
+    # appear as pure tracked-insert paragraphs without breaking alignment.
+    result["final_text_revisions_only"] = final_text
+
+    if insertions:
+        final_text = _insert_new_clauses(final_text, insertions)
+
     result["final_text"] = final_text
+
+    print(f"\n{'#'*80}")
+    print(f"  STEP 3: ASSEMBLY (local text stitching)")
+    print(f"{'#'*80}")
+    if final_text != contract_text:
+        print(f"  Final text length: {len(final_text)} chars (original: {len(contract_text)} chars)")
+        print(f"  [Final text]")
+        for line in final_text.split('\n'):
+            print(f"    {line}")
+    else:
+        print(f"  No changes — final text is identical to original.")
+    print()
 
     # ── Step 4: Issues List (optional) ───────────────────────────
     if generate_issues:
@@ -256,6 +415,19 @@ def unified_review_contract(
         result["executive_summary"] = issues_result.get("executive_summary", "")
         result["compliance_score"] = issues_result.get("compliance_score", {})
 
+        print(f"\n{'#'*80}")
+        print(f"  STEP 4: ISSUES & RISK SUMMARY")
+        print(f"{'#'*80}")
+        print(f"  Executive Summary: {result['executive_summary']}")
+        print(f"  Compliance Score: {result['compliance_score']}")
+        print(f"  Issues ({len(result['issues_list'])}):")
+        for iss in result["issues_list"]:
+            sev = iss.get("severity", "?")
+            title = iss.get("title", iss.get("description", "?"))
+            cat = iss.get("category", "")
+            print(f"    [{sev}] {title}" + (f"  ({cat})" if cat else ""))
+        print()
+
         issue_thinking = []
         if result["executive_summary"]:
             issue_thinking.append(f"Executive summary: {result['executive_summary']}")
@@ -279,6 +451,19 @@ def unified_review_contract(
 
     # ── Finalise ─────────────────────────────────────────────────
     result["llm_stats"] = client.get_stats()
+
+    stats = result["llm_stats"]
+    print(f"\n{'#'*80}")
+    print(f"  PIPELINE COMPLETE")
+    print(f"{'#'*80}")
+    print(f"  Total LLM calls: {stats.get('total_calls', 0)}")
+    print(f"  Total duration:  {stats.get('total_duration', 0):.1f}s")
+    print(f"  Total tokens:    {stats.get('total_tokens', 0):,}")
+    for i, call in enumerate(stats.get("calls", []), 1):
+        print(f"    Call {i}: task={call.get('task','')}  model={call.get('model','')}"
+              f"  {call.get('duration',0):.1f}s  {call.get('tokens',0):,} tokens")
+    print(f"{'#'*80}\n")
+
     _progress("done", "Review complete")
     return result
 
@@ -298,16 +483,90 @@ def _normalize_text(text: str) -> str:
     return re.sub(r'\s+', ' ', text.translate(_PUNCT_MAP)).strip()
 
 
+def _safe_attachment_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value or "").strip("._")
+    return cleaned or "attachment"
+
+
+def _build_playbook_file_attachments(
+    playbook_entries: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """
+    Build in-memory file attachments so Gemini native SDK can receive each
+    selected playbook as a separate uploaded file.
+    """
+    attachments: List[Dict[str, Any]] = []
+    for idx, entry in enumerate(playbook_entries or [], 1):
+        rid = str(entry.get("id", f"rule_{idx}"))
+        title = str(entry.get("title", "Rule"))
+        source_file = str(entry.get("source_file", f"{rid}.md"))
+        priority = str(entry.get("priority", "P1"))
+        rule_type = str(entry.get("type", "rule"))
+        body = str(entry.get("markdown_body", "") or "")
+
+        file_text = (
+            f"# {title}\n\n"
+            f"- id: {rid}\n"
+            f"- type: {rule_type}\n"
+            f"- priority: {priority}\n"
+            f"- source_file: {source_file}\n\n"
+            f"{body}\n"
+        )
+        file_name = _safe_attachment_name(f"playbook_{rid}.md")
+        attachments.append({
+            "display_name": f"Playbook_{idx}_{_safe_attachment_name(rid)}",
+            "file_name": file_name,
+            "mime_type": "text/markdown",
+            "content_bytes": file_text.encode("utf-8"),
+        })
+    return attachments
+
+
 def _group_analyses_by_clause(
     analyses: List[Dict[str, Any]],
+    playbook_entries: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Group analysis entries by clause_text so each unique clause is revised
     only once, even if multiple rules apply to it.
 
     Returns a list of dicts:
-      { clause_id, clause_text, clause_location, applicable_rule_ids, combined_gaps, severity }
+      {
+        clause_id, clause_text, clause_location, applicable_rule_ids, combined_gaps, severity,
+        highest_priority, priority_rule_ids, has_conflict, conflict_notes
+      }
     """
+    priority_by_rule_id: Dict[str, str] = {}
+    for entry in playbook_entries or []:
+        rid = str(entry.get("id", "")).strip()
+        if not rid:
+            continue
+        priority = str(entry.get("priority", "P1")).strip().upper()
+        priority_by_rule_id[rid] = priority if priority.startswith("P") else "P1"
+
+    def _priority_rank(priority: str) -> int:
+        ranks = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+        return ranks.get(str(priority).upper(), 9)
+
+    def _detect_conflicts(gaps: List[str]) -> List[str]:
+        notes: List[str] = []
+        merged = "\n".join(gaps).lower()
+
+        has_insert = bool(re.search(r"\b(add|insert|append|include)\b", merged))
+        has_replace = bool(re.search(r"\b(replace|substitute|remove|delete)\b", merged))
+        if has_insert and has_replace:
+            notes.append(
+                "Mixed edit intents detected (insert + replace/remove). "
+                "Prioritize replacement when both cannot coexist cleanly."
+            )
+
+        if "before or after" in merged and "on or after" in merged:
+            notes.append(
+                "Potential time-scope conflict detected: both 'before or after' and "
+                "'on or after' appear in gap assessments."
+            )
+        return notes
+
     groups: Dict[str, Dict[str, Any]] = {}
 
     for item in analyses:
@@ -325,6 +584,7 @@ def _group_analyses_by_clause(
                 "applicable_rule_ids": [],
                 "combined_gaps": [],
                 "severity": item.get("severity", "YELLOW"),
+                "rule_priorities": {},
             }
 
         rule_ids = item.get("applicable_rule_ids", [])
@@ -333,6 +593,7 @@ def _group_analyses_by_clause(
         for rid in rule_ids:
             if rid not in groups[norm_key]["applicable_rule_ids"]:
                 groups[norm_key]["applicable_rule_ids"].append(rid)
+            groups[norm_key]["rule_priorities"][rid] = priority_by_rule_id.get(rid, "P2")
 
         gaps = item.get("gaps", "")
         if gaps and gaps not in groups[norm_key]["combined_gaps"]:
@@ -343,7 +604,45 @@ def _group_analyses_by_clause(
 
     result = []
     for g in groups.values():
-        g["combined_gaps"] = "\n".join(g["combined_gaps"])
+        priority_rule_ids = sorted(
+            g["applicable_rule_ids"],
+            key=lambda rid: (_priority_rank(g["rule_priorities"].get(rid, "P2")), str(rid)),
+        )
+        g["priority_rule_ids"] = priority_rule_ids
+        g["highest_priority"] = (
+            g["rule_priorities"].get(priority_rule_ids[0], "P2")
+            if priority_rule_ids else "P2"
+        )
+
+        conflict_notes = _detect_conflicts(g["combined_gaps"])
+        top_tier = [
+            rid for rid in priority_rule_ids
+            if g["rule_priorities"].get(rid, "P2") == g["highest_priority"]
+        ]
+        if len(top_tier) > 1:
+            conflict_notes.append(
+                f"Multiple top-priority rules ({g['highest_priority']}) apply to this clause: "
+                + ", ".join(top_tier)
+            )
+        g["has_conflict"] = bool(conflict_notes)
+        g["conflict_notes"] = conflict_notes
+
+        combined = "\n".join(g["combined_gaps"]).strip()
+        if priority_rule_ids:
+            priority_lines = [
+                f"- {rid}: {g['rule_priorities'].get(rid, 'P2')}" for rid in priority_rule_ids
+            ]
+            combined += (
+                "\n\n[PRIORITY ANNOTATION]\n"
+                "Apply lower-numbered priority first (P0 > P1 > P2 > P3).\n"
+                + "\n".join(priority_lines)
+            )
+        if conflict_notes:
+            combined += (
+                "\n\n[CONFLICT CHECK]\n"
+                + "\n".join(f"- {note}" for note in conflict_notes)
+            )
+        g["combined_gaps"] = combined
         result.append(g)
     return result
 
@@ -387,6 +686,10 @@ def _revise_clauses_parallel(
             "changes_made": rev_result.get("changes_made", []),
             "severity": group["severity"],
             "applicable_rule_ids": group["applicable_rule_ids"],
+            "highest_priority": group.get("highest_priority", "P2"),
+            "priority_rule_ids": group.get("priority_rule_ids", []),
+            "has_conflict": group.get("has_conflict", False),
+            "conflict_notes": group.get("conflict_notes", []),
         }
 
     max_workers = min(4, len(clause_groups))
@@ -479,6 +782,82 @@ def _assemble_final_text(
             "Could not locate clause '%s' in contract for assembly",
             rev.get("clause_id"),
         )
+
+    return current
+
+
+def _find_insert_position(text: str, insert_after: str) -> int:
+    """Find the end-of-paragraph position after the section matching *insert_after*."""
+    if not insert_after:
+        return -1
+
+    idx = text.find(insert_after)
+    if idx >= 0:
+        para_end = text.find("\n\n", idx + len(insert_after))
+        return para_end if para_end >= 0 else len(text)
+
+    norm_after = _normalize_text(insert_after)
+    if len(norm_after) < 10:
+        return -1
+
+    escaped_words = [re.escape(w) for w in norm_after.split()[:20]]
+    flex_pattern = r'\s+'.join(escaped_words)
+    match = re.search(flex_pattern, text, re.IGNORECASE)
+    if match:
+        para_end = text.find("\n\n", match.end())
+        return para_end if para_end >= 0 else len(text)
+
+    return -1
+
+
+_SIGNATURE_MARKERS = [
+    "Very truly yours",
+    "Sincerely",
+    "IN WITNESS WHEREOF",
+    "(Remainder of page intentionally left blank)",
+]
+
+
+def _insert_new_clauses(
+    text: str,
+    insertions: List[Dict[str, Any]],
+) -> str:
+    """Insert new clauses at designated locations in the contract text."""
+    current = text
+
+    for ins in insertions:
+        insert_after = ins.get("insert_after", "").strip()
+        clause_text = ins.get("clause_text", "").strip()
+        clause_heading = ins.get("clause_heading", "")
+
+        if not clause_text:
+            continue
+
+        if insert_after.upper() == "END":
+            current = current.rstrip() + "\n\n" + clause_text
+            logger.info("Inserted clause '%s' at END", clause_heading)
+            continue
+
+        pos = _find_insert_position(current, insert_after)
+        if pos >= 0:
+            current = current[:pos] + "\n\n" + clause_text + current[pos:]
+            logger.info("Inserted clause '%s' after '%s'", clause_heading, insert_after[:50])
+            continue
+
+        inserted = False
+        for marker in _SIGNATURE_MARKERS:
+            idx = current.find(marker)
+            if idx > 0:
+                current = current[:idx] + clause_text + "\n\n" + current[idx:]
+                logger.info(
+                    "Inserted clause '%s' before signature block (fallback)",
+                    clause_heading,
+                )
+                inserted = True
+                break
+        if not inserted:
+            current = current.rstrip() + "\n\n" + clause_text
+            logger.info("Inserted clause '%s' at document end (fallback)", clause_heading)
 
     return current
 

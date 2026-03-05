@@ -62,7 +62,24 @@ The definition is strictly limited to individuals or entities listed above who *
 - **Standard of Care:** Establishes that the Receiving Party is only responsible for the conduct of those it has affirmatively directed to receive the Confidential Information.
 - **Burden of Proof:** Shifts the focus from a theoretical list of parties to a factual determination of who was actually "in the loop."
 
-## 5. Data Mapping for Document Generation
+## 5. Drafting Pattern [CRITICAL]
+
+The "Actual Receipt" qualifier **MUST** be embedded **INLINE** within the parenthetical that defines "Representatives". It must NOT be drafted as a separate standalone sentence.
+
+**Correct pattern — qualifier INSIDE the parenthetical:**
+> "...your affiliates and affiliated funds, and your and their respective officers, directors, employees, partners, members, legal counsel, consultants, accountants, financial advisors, insurers, potential financing sources, and other agents and representatives **(such parties who actually receive [Confidential Info Term] from [Recipient Term] or at [Recipient Term]'s direction, collectively, "Representatives")**"
+
+**WRONG — qualifier as a separate sentence or relative clause:**
+> ~~"...(collectively, "Representatives") who actually receive..."~~
+> ~~"...(collectively, "Representatives"). Representatives means only those parties who actually receive..."~~
+
+**AI Drafting Rule:**
+1. Find the existing parenthetical `(collectively, "Representatives")` or equivalent.
+2. Replace it with `(such parties who actually receive [Confidential Info Term] from [Recipient Term] or at [Recipient Term]'s direction, collectively, "Representatives")`.
+3. Adapt `[Confidential Info Term]` and `[Recipient Term]` to the contract's own defined terms (e.g., "Evaluation Material", "you").
+4. Do NOT add a separate sentence or relative clause for the qualifier.
+
+## 6. Data Mapping for Document Generation
 
 | Field | Value |
 |-------|-------|

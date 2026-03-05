@@ -44,9 +44,17 @@ This rule set is the "Gold Standard" for protecting a Recipient from overbroad c
 > "...if such information (i) is public, (ii) was known to you, or (iii) was received from a third party."
 
 **Polished Version (AI-Optimized):**
-> "...and the information is not Evaluation Material if such information: (i) is generally available to the public other than as a result of a disclosure by you [or your Representatives]*; (ii) was available to you or your Representatives on a non-confidential basis prior to disclosure by the Company; (iii) becomes available to you or your Representatives from a source other than the Company when such source, to your or your Representatives' knowledge, is not prohibited from disclosing such information; (iv) is independently developed by you or your Representatives without use of or reference to the Evaluation Material; or (v) is Residual Information [Insert full Residuals Definition]."
+> "...and the information is not Evaluation Material if such information: (i) is generally available to the public other than as a result of a disclosure by you [or your Representatives]*; (ii) was available to you or your Representatives on a non-confidential basis prior to disclosure by the Company; (iii) becomes available to you or your Representatives from a source other than the Company when such source, to your or your Representatives' knowledge, is not prohibited from disclosing such information; (iv) is independently developed by you or your Representatives without use of or reference to the Evaluation Material; or (v) is Residual Information."
 
 *Note: Only include Reps in (i) if the original text had them.
+
+## 4b. Residual Information — Standardized Definition [VERBATIM]
+
+The following paragraph is the **STANDARDIZED TEXT** for the Residual Information carve-out. When adding item (v) to the exclusions list, the AI **MUST** use this paragraph **IN FULL** — do not shorten, paraphrase, or summarize. Only adapt the defined terms (e.g., "Evaluation Material", "you", "your Representatives") to match the contract's own terminology.
+
+> **[VERBATIM — USE COMPLETE PARAGRAPH]**
+>
+> "Residual Information" means any information that is retained in the unaided memory of any person who has had access to the Evaluation Material, including ideas, concepts, know-how, or techniques contained therein. A person's memory is "unaided" if the person has not intentionally memorized the Evaluation Material for the purpose of retaining and subsequently using or disclosing it. Nothing in this Agreement shall be deemed to grant to you or your Representatives a license under the Company's copyrights, patents, or trade secrets.
 
 ## 5. Strategic "Why" for AI Reasoning
 
