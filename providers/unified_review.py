@@ -165,6 +165,13 @@ def unified_review_contract(
         for rid in (item.get("applicable_rule_ids") or []):
             missing_rule_ids.add(rid)
 
+    if "blind_nda" in missing_rule_ids and _has_template_placeholders(contract_text):
+        logger.info(
+            "blind_nda suppressed: contract contains template placeholders "
+            "(e.g. [CLIENT NAME]), not a true Blind NDA."
+        )
+        missing_rule_ids.discard("blind_nda")
+
     # Group by clause_text to avoid revising the same clause multiple times
     clause_groups = _group_analyses_by_clause(clauses_needing_revision, playbook_entries)
 
@@ -476,6 +483,19 @@ _PUNCT_MAP = str.maketrans({
     '\u2014': '-', '\u2013': '-',
     '\u00a0': ' ',
 })
+
+
+_TEMPLATE_PLACEHOLDER_RE = re.compile(
+    r"\[(?:CLIENT|COMPANY|DISCLOSING\s+PARTY|PARTY|ENTITY|TARGET)\s*NAME\]",
+    re.IGNORECASE,
+)
+
+
+def _has_template_placeholders(contract_text: str) -> bool:
+    """Return True if the contract uses standard fill-in-the-blank placeholders
+    for the company name (e.g. [CLIENT NAME]), indicating an unsigned template
+    rather than a genuine Blind NDA with a concealed identity."""
+    return bool(_TEMPLATE_PLACEHOLDER_RE.search(contract_text))
 
 
 def _normalize_text(text: str) -> str:

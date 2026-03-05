@@ -40,6 +40,12 @@ one analysis entry per (clause, rule) pair.
 - clause_text must be a VERBATIM copy-paste from the contract.
 - If a rule targets a concept that doesn't exist in the contract at all, \
 set clause_text to empty string and note the absence in gaps.
+- TEMPLATE PLACEHOLDERS: Bracketed tokens like [CLIENT NAME], [COMPANY NAME], \
+[DISCLOSING PARTY], [NAME OF POTENTIAL ACQUIROR] are standard fill-in-the-blank \
+markers for unsigned drafts. They are NOT evidence of concealed identity. \
+Do NOT treat them as triggers for the "blind_nda" / Conflict Check rule. \
+A genuine Blind NDA uses descriptive language to hide identity (e.g. \
+"a company", "the Target", "Project Alpha").
 
 Return ONLY the JSON object specified in the user prompt."""
 

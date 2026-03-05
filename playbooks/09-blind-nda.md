@@ -10,7 +10,12 @@ priority: P1
 
 ## 1. Rule Summary
 
-**Trigger:** Any NDA where the Disclosing Party (Company) identity is initially withheld or replaced with a code name **in the body of the agreement** (e.g., "a company" or "[Company Name]" as the disclosing party). Do NOT trigger merely because the signature block has a placeholder like "[CLIENT NAME]" — that is standard for unsigned drafts.
+**Trigger:** Any NDA where the Disclosing Party's real identity is **deliberately concealed** behind a code name or generic description **in the body of the agreement** (e.g., "a company", "Project Alpha", "the Target").
+
+**CRITICAL EXCLUSION — Template Placeholders:**
+Do NOT trigger for standard fill-in-the-blank placeholders such as `[CLIENT NAME]`, `[COMPANY NAME]`, `[NAME OF COMPANY]`, `[DISCLOSING PARTY]`, or any `[BRACKETED ALL-CAPS]` token. These are standard template markers for unsigned drafts — the drafter intends to fill in the real name before execution. A placeholder is NOT identity concealment.
+
+A true Blind NDA uses **descriptive language** that hides who the company is (e.g., "a company operating in the technology sector", "the Target", "Project Phoenix") — not a bracketed blank waiting to be filled in.
 
 | Logic Condition | AI Polished Action |
 |-----------------|-------------------|

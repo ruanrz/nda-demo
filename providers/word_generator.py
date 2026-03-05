@@ -618,6 +618,26 @@ def _normalize_paragraph_for_alignment(text: str) -> str:
     return re.sub(r"\s+", " ", text.translate(_PARA_PUNCT_MAP)).strip()
 
 
+_LOW_SIMILARITY_THRESHOLD = 0.30
+
+
+def _paragraphs_are_too_different(orig_p: str, mod_p: str) -> bool:
+    """Return True when orig_p and mod_p are so dissimilar that word-level
+    diffing would produce an unreadable mess of interleaved del/ins runs.
+
+    Uses a quick SequenceMatcher ratio on normalised text.  When both texts
+    exist but share < 30% content the paragraphs are essentially different
+    clauses (e.g. because the AI reordered paragraphs).
+    """
+    if not orig_p or not mod_p:
+        return False
+    norm_a = _normalize_paragraph_for_alignment(orig_p)
+    norm_b = _normalize_paragraph_for_alignment(mod_p)
+    if not norm_a or not norm_b:
+        return False
+    return SequenceMatcher(None, norm_a, norm_b).ratio() < _LOW_SIMILARITY_THRESHOLD
+
+
 def _render_paragraph_diff(
     doc: Document,
     para: Paragraph,
@@ -633,6 +653,8 @@ def _render_paragraph_diff(
     Render a paragraph diff into an existing paragraph and return next revision id.
 
     - If normalized text is effectively equal, keep paragraph clean.
+    - If paragraphs are too dissimilar (< 30% overlap), render a clean
+      full-deletion + full-insertion instead of a noisy word-level diff.
     - Only changed paragraphs get rewritten with ins/del revisions.
     """
     _clear_paragraph_content(para)
@@ -645,6 +667,19 @@ def _render_paragraph_diff(
             run = para.add_run(mod_p)
             run.font.color.rgb = _BLACK
         return revision_id
+
+    if _paragraphs_are_too_different(orig_p, mod_p):
+        return _render_full_replace(
+            doc=doc,
+            para=para,
+            orig_p=orig_p,
+            mod_p=mod_p,
+            modifications=modifications,
+            author=author,
+            revision_id=revision_id,
+            date_iso=date_iso,
+            revisions=revisions,
+        )
 
     diffs = compute_word_diffs(orig_p, mod_p)
     comment_anchor: Optional[Run] = None
@@ -684,6 +719,50 @@ def _render_paragraph_diff(
             if not comment_reason:
                 comment_reason = _find_mod_reason(orig_p, mod_p, text, modifications, revisions=revisions)
 
+    if not comment_reason:
+        comment_reason = "Playbook-driven edit: aligned clause with selected review rules."
+    if comment_anchor is not None:
+        _try_add_comment(doc, comment_anchor, comment_reason)
+    return revision_id
+
+
+def _render_full_replace(
+    doc: Document,
+    para: Paragraph,
+    orig_p: str,
+    mod_p: str,
+    modifications: List[Dict[str, Any]],
+    author: str,
+    revision_id: int,
+    date_iso: str,
+    revisions: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Render a complete paragraph replacement as a clean tracked-delete
+    followed by a tracked-insert.  Used when original and modified paragraphs
+    are too dissimilar for word-level diffing to be useful."""
+    comment_anchor: Optional[Run] = None
+
+    if orig_p:
+        deleted_run = _append_tracked_delete(
+            para=para, text=orig_p,
+            revision_id=revision_id, author=author, date_iso=date_iso,
+        )
+        revision_id += 1
+        if deleted_run is not None:
+            comment_anchor = deleted_run
+
+    if mod_p:
+        inserted_run = _append_tracked_insert(
+            para=para, text=mod_p,
+            revision_id=revision_id, author=author, date_iso=date_iso,
+        )
+        revision_id += 1
+        if inserted_run is not None and comment_anchor is None:
+            comment_anchor = inserted_run
+
+    comment_reason = _find_mod_reason(
+        orig_p, mod_p, mod_p or orig_p, modifications, revisions=revisions,
+    )
     if not comment_reason:
         comment_reason = "Playbook-driven edit: aligned clause with selected review rules."
     if comment_anchor is not None:
