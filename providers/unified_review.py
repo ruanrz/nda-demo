@@ -361,11 +361,19 @@ def unified_review_contract(
             rid = ins.get("rule_id", "?")
             reasoning = ins.get("reasoning", "")
             insert_after = ins.get("insert_after", "?")
+            full_clause = ins.get("clause_text", "")
             print(f"\n  --- Insertion {i}: {heading} (rule={rid}) ---")
             print(f"  Insert after: {insert_after}")
             print(f"  Reasoning: {reasoning}")
-            clause_preview = ins.get("clause_text", "")[:300]
-            print(f"  [Clause preview]\n{clause_preview}…")
+            print(f"  [Full clause text] ({len(full_clause)} chars)")
+            print(f"{full_clause}")
+            if rid == "mandatory_language":
+                has_a = "Dual Representative" in full_clause
+                has_b = "investment business" in full_clause.lower() or "competitors" in full_clause.lower()
+                has_c = "electronic data room" in full_clause.lower()
+                print(f"  [mandatory_language check] Rule A (Dual Rep): {'YES' if has_a else 'MISSING'}")
+                print(f"  [mandatory_language check] Rule B (Non-Restriction): {'YES' if has_b else 'MISSING'}")
+                print(f"  [mandatory_language check] Rule C (Data Room): {'YES' if has_c else 'MISSING'}")
         print()
 
         _progress("insertion_done", f"Drafted {len(insertions)} new clauses")
@@ -844,40 +852,49 @@ def _insert_new_clauses(
 ) -> str:
     """Insert new clauses at designated locations in the contract text."""
     current = text
+    logger.info("_insert_new_clauses: processing %d insertions", len(insertions))
 
     for ins in insertions:
         insert_after = ins.get("insert_after", "").strip()
         clause_text = ins.get("clause_text", "").strip()
         clause_heading = ins.get("clause_heading", "")
+        rule_id = ins.get("rule_id", "")
 
         if not clause_text:
+            logger.warning("Skipping insertion '%s' (rule=%s): empty clause_text", clause_heading, rule_id)
             continue
+
+        logger.info(
+            "Inserting '%s' (rule=%s): %d chars, insert_after='%s'",
+            clause_heading, rule_id, len(clause_text), insert_after[:80],
+        )
 
         if insert_after.upper() == "END":
             current = current.rstrip() + "\n\n" + clause_text
-            logger.info("Inserted clause '%s' at END", clause_heading)
+            logger.info("  -> Inserted at END")
             continue
 
         pos = _find_insert_position(current, insert_after)
         if pos >= 0:
             current = current[:pos] + "\n\n" + clause_text + current[pos:]
-            logger.info("Inserted clause '%s' after '%s'", clause_heading, insert_after[:50])
+            logger.info("  -> Inserted at position %d (after '%s')", pos, insert_after[:50])
             continue
 
+        logger.warning(
+            "  -> insert_after='%s' not found in text (%d chars), trying signature fallback",
+            insert_after[:80], len(current),
+        )
         inserted = False
         for marker in _SIGNATURE_MARKERS:
             idx = current.find(marker)
             if idx > 0:
                 current = current[:idx] + clause_text + "\n\n" + current[idx:]
-                logger.info(
-                    "Inserted clause '%s' before signature block (fallback)",
-                    clause_heading,
-                )
+                logger.info("  -> Inserted before signature marker '%s' at pos %d", marker, idx)
                 inserted = True
                 break
         if not inserted:
             current = current.rstrip() + "\n\n" + clause_text
-            logger.info("Inserted clause '%s' at document end (fallback)", clause_heading)
+            logger.info("  -> Inserted at document end (final fallback)")
 
     return current
 

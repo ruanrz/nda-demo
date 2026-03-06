@@ -6,6 +6,7 @@ Presets available (selected via MODEL_PRESET env var or UI):
 - "quality"       : o3 for analysis, gpt-4o for summary/validation (best accuracy)
 - "cost"          : gpt-4o for analysis/execution, gpt-4o-mini for summary
 - "gemini"        : Gemini 3.1 Pro via Google's OpenAI-compatible endpoint
+- "gpt54"         : GPT-5.4 (2026-03-05) for all tasks via OpenAI API
 """
 
 import os
@@ -17,7 +18,7 @@ import tempfile
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
-from openai import OpenAI, RateLimitError
+from openai import OpenAI, RateLimitError, APIConnectionError, APITimeoutError, InternalServerError
 
 logger = logging.getLogger("llm_client")
 
@@ -51,12 +52,28 @@ GEMINI_ROUTING = {
     "validation":  "gemini-3.1-pro-preview",
 }
 
+GPT54_ROUTING = {
+    "analysis":    "gpt-5.4-2026-03-05",
+    "revision":    "gpt-5.4-2026-03-05",
+    "insertion":   "gpt-5.4-2026-03-05",
+    "execution":   "gpt-5.4-2026-03-05",
+    "parsing":     "gpt-5.4-2026-03-05",
+    "summary":     "gpt-5.4-2026-03-05",
+    "validation":  "gpt-5.4-2026-03-05",
+}
+
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
-PRESETS = {"quality": QUALITY_ROUTING, "cost": COST_ROUTING, "gemini": GEMINI_ROUTING}
+PRESETS = {
+    "quality": QUALITY_ROUTING,
+    "cost": COST_ROUTING,
+    "gemini": GEMINI_ROUTING,
+    "gpt54": GPT54_ROUTING,
+}
 
 PROVIDER_LABELS = {
     "gemini": "Google Gemini 3.1 Pro Preview",
+    "gpt54": "OpenAI GPT-5.4 (2026-03-05)",
 }
 
 
@@ -685,14 +702,14 @@ class LLMClient:
         for attempt in range(4):
             try:
                 return self.client.chat.completions.create(**current_kwargs)
-            except RateLimitError as exc:
+            except (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError) as exc:
                 rate_limit_retries += 1
                 if rate_limit_retries > max_rate_limit_retries:
                     raise self._to_user_error(exc, current_kwargs)
                 delay = base_delay * (2 ** (rate_limit_retries - 1))
                 logger.warning(
-                    "Rate limited (429) on attempt %d — retrying in %.1fs (retry %d/%d)",
-                    attempt + 1, delay, rate_limit_retries, max_rate_limit_retries,
+                    "Request failed (%s) on attempt %d — retrying in %.1fs (retry %d/%d)",
+                    type(exc).__name__, attempt + 1, delay, rate_limit_retries, max_rate_limit_retries,
                 )
                 time.sleep(delay)
                 attempt = max(attempt - 1, 0)  # don't consume a compat-retry slot
@@ -797,6 +814,16 @@ class LLMClient:
                 (
                     f"{provider} 配额不足或请求频率超限（endpoint: {endpoint}, model: {model}）。"
                     " 请检查账号额度/账单状态，或稍后重试。"
+                ),
+                code=error_code,
+                details=error_text,
+            )
+
+        if "connection error" in error_lower or "timeout" in error_lower or "connect" in error_lower:
+            return LLMCallError(
+                (
+                    f"{provider} 连接失败（endpoint: {endpoint}, model: {model}）。"
+                    " 请检查网络连接或代理设置（HTTPS_PROXY）。"
                 ),
                 code=error_code,
                 details=error_text,

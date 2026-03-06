@@ -16,6 +16,7 @@ comment per changed paragraph/revision anchor.
 
 import copy
 import io
+import logging
 import re
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -45,6 +46,8 @@ _PARA_PUNCT_MAP = str.maketrans({
     "\u2013": "-",
     "\u00a0": " ",
 })
+
+logger = logging.getLogger("word_generator")
 
 _WORD_TOKEN_RE = re.compile(r"\w+|[^\w\s]|\s+")
 
@@ -618,7 +621,7 @@ def _normalize_paragraph_for_alignment(text: str) -> str:
     return re.sub(r"\s+", " ", text.translate(_PARA_PUNCT_MAP)).strip()
 
 
-_LOW_SIMILARITY_THRESHOLD = 0.30
+_LOW_SIMILARITY_THRESHOLD = 0.15
 
 
 def _paragraphs_are_too_different(orig_p: str, mod_p: str) -> bool:
@@ -665,7 +668,8 @@ def _render_paragraph_diff(
     ):
         if mod_p:
             run = para.add_run(mod_p)
-            run.font.color.rgb = _BLACK
+            # Don't force black color - let style dictate unless explicitly needed
+            # run.font.color.rgb = _BLACK 
         return revision_id
 
     if _paragraphs_are_too_different(orig_p, mod_p):
@@ -689,7 +693,8 @@ def _render_paragraph_diff(
             continue
         if op == dmp_module.diff_match_patch.DIFF_EQUAL:
             run = para.add_run(text)
-            run.font.color.rgb = _BLACK
+            # Don't force black color on unchanged text
+            # run.font.color.rgb = _BLACK
             if comment_anchor is None:
                 comment_anchor = run
         elif op == dmp_module.diff_match_patch.DIFF_DELETE:
@@ -771,13 +776,17 @@ def _render_full_replace(
 
 
 def _split_contract_paragraphs(text: str) -> List[str]:
-    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    if not normalized.strip():
+    """
+    Split text into paragraphs, normalizing line breaks.
+    Always treats any sequence of newlines (\n, \n\n, \r\n) as a paragraph separator.
+    This prevents AI-generated single-newline blocks from being merged into one giant paragraph
+    when the rest of the document uses double-newlines.
+    """
+    if not text:
         return []
-    if "\n\n" in normalized:
-        chunks = re.split(r"\n{2,}", normalized)
-    else:
-        chunks = normalized.split("\n")
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Split on one or more newlines to handle both single and double spacing robustly
+    chunks = re.split(r"\n+", normalized)
     return [p.strip() for p in chunks if p.strip()]
 
 
@@ -862,11 +871,30 @@ def _add_redline_paragraphs_from_template(
             p = anchor.insert_paragraph_before("")
         else:
             p = doc.add_paragraph()
+        
         if style_source is not None:
+            # 1. Copy the style object
             try:
                 p.style = style_source.style
             except Exception:
                 pass
+            
+            # 2. Deep copy paragraph properties (w:pPr) to preserve indentation, numbering, etc.
+            # This is critical for preserving list structures when AI splits paragraphs.
+            try:
+                source_pPr = style_source._p.find(qn("w:pPr"))
+                if source_pPr is not None:
+                    # Remove any existing pPr (created by insert_paragraph_before)
+                    existing_pPr = p._p.find(qn("w:pPr"))
+                    if existing_pPr is not None:
+                        p._p.remove(existing_pPr)
+                    
+                    # Deep copy the source pPr and insert it
+                    new_pPr = copy.deepcopy(source_pPr)
+                    p._p.insert(0, new_pPr)
+            except Exception:
+                pass
+                
         return p
 
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -1073,23 +1101,43 @@ def _add_insertion_paragraphs(doc: Document, insertions: List[Dict[str, Any]]) -
     numbering. Order: Blind NDA (if any), then mandatory_language A, B, C.
     """
     if not insertions:
+        logger.info("_add_insertion_paragraphs: no insertions to process")
         return
 
+    logger.info("_add_insertion_paragraphs: processing %d insertions", len(insertions))
     insertions = _sort_insertions_for_mandatory_order(insertions)
     anchor = _find_insertion_anchor(doc)
+    anchor_method = "numbered_paragraph"
     if anchor is None:
         anchor = _find_signature_anchor(doc)
+        anchor_method = "signature_marker" if anchor else "none"
+    logger.info(
+        "  Anchor: method=%s, text='%s'",
+        anchor_method,
+        (anchor.text or "")[:80] if anchor else "(no anchor — will append)",
+    )
+
     style_source, num_pr_source = _get_style_and_num_pr(doc, anchor)
+    logger.info("  Style source: %s, numPr: %s", style_source is not None, num_pr_source is not None)
+
     author = "AI Legal Assistant"
     date_iso = _iso_now_utc()
     revision_id = 9000
+    total_paragraphs_inserted = 0
 
     for ins in reversed(insertions):
         clause_text = (ins.get("clause_text") or "").strip()
+        rule_id = ins.get("rule_id", "?")
+        heading = ins.get("clause_heading", "?")
         if not clause_text:
+            logger.warning("  Skipping '%s' (rule=%s): empty clause_text", heading, rule_id)
             continue
 
         chunks = [c.strip() for c in clause_text.split("\n\n") if c.strip()]
+        logger.info(
+            "  Inserting '%s' (rule=%s): %d chars, %d paragraph chunks",
+            heading, rule_id, len(clause_text), len(chunks),
+        )
 
         # When inserting before an anchor, each insert_paragraph_before +
         # anchor update reverses iteration order (same reason the outer loop
@@ -1120,9 +1168,12 @@ def _add_insertion_paragraphs(doc: Document, insertions: List[Dict[str, Any]]) -
                 date_iso=date_iso,
             )
             revision_id += 1
+            total_paragraphs_inserted += 1
 
             if anchor is not None:
                 anchor = para
+
+    logger.info("  Total paragraphs inserted as tracked changes: %d", total_paragraphs_inserted)
 
 
 def _short_reason(reason: str, max_len: int = 500) -> str:

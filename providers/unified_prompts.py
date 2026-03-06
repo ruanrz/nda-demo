@@ -148,6 +148,10 @@ or grammatical breaks.
 equivalent to what the rule requires, preserve them.
 - PRESERVE all placeholders such as [Date], [CLIENT NAME], [NAME OF POTENTIAL \
 ACQUIROR], or similar [BRACKETED] markers — do not modify, remove, or replace them.
+- **PRESERVE PARAGRAPH STRUCTURE:** If the original clause contains multiple paragraphs \
+or list items (bullet points, (a), (b), etc.), the revised version MUST maintain the \
+exact same number of paragraphs/items. Do NOT merge multiple list items into a single \
+block of text. Do NOT reformat a list into a paragraph.
 
 Return ONLY the JSON object specified in the user prompt."""
 

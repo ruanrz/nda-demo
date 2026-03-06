@@ -43,6 +43,22 @@ if not logger.handlers:
     fh.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
     logger.addHandler(fh)
 
+for _sub_logger_name in ("unified_review", "word_generator"):
+    _sub = logging.getLogger(_sub_logger_name)
+    _sub.setLevel(logging.DEBUG)
+    if not _sub.handlers:
+        _sub_ch = logging.StreamHandler()
+        _sub_ch.setLevel(logging.INFO)
+        _sub_ch.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+        _sub.addHandler(_sub_ch)
+        _sub_fh = logging.FileHandler(
+            os.path.join(LOG_DIR, f"demo_{datetime.now().strftime('%Y%m%d')}.log"),
+            encoding="utf-8",
+        )
+        _sub_fh.setLevel(logging.DEBUG)
+        _sub_fh.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+        _sub.addHandler(_sub_fh)
+
 # ── Path setup ───────────────────────────────────────────────────
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 _providers_dir = os.path.join(_current_dir, "providers")
@@ -575,7 +591,11 @@ def render_contract_review_tab():
         index=preset_labels.index(PROVIDER_LABELS.get(
             st.session_state.get("selected_preset", "gemini"), preset_labels[0]
         )),
-        help="Choose the LLM backend. Gemini 3.1 Pro uses Google's API (requires GOOGLE_API_KEY).",
+        help=(
+            "Choose the LLM backend. "
+            "Gemini uses Google's API (requires GOOGLE_API_KEY). "
+            "GPT-5.4 / quality / cost use OpenAI's API (requires OPENAI_API_KEY)."
+        ),
     )
     preset = preset_options[preset_labels.index(selected_label)]
     st.session_state["selected_preset"] = preset
@@ -593,6 +613,11 @@ def render_contract_review_tab():
             )
     else:
         api_key_present = bool(os.environ.get("OPENAI_API_KEY"))
+        if not api_key_present:
+            st.warning(
+                f"**{PROVIDER_LABELS.get(preset, preset)}** 模式需要设置 `OPENAI_API_KEY` 环境变量。"
+                " 请在启动应用前设置：`export OPENAI_API_KEY=your_key`"
+            )
 
     routing = PRESETS.get(preset, {})
     with st.expander("Model routing details", expanded=False):
